@@ -1,7 +1,7 @@
 // Token Radar's entry program (Node 22, standard library only).
 //
 // It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
-// rankable pre-token protocol with the radar-2 model in lib/model.ts, writes the ranked board to
+// rankable pre-token protocol with the radar-3 model in lib/model.ts, writes the ranked board to
 // /output/board.json, writes the dashboard's data beside the page as data.js, copies this
 // repository's dashboard/ and screenshots/ to /output, and writes /output/dossier.json with
 // buildDossier from vendor/makefun-board.ts, the make.fun dossier library.
@@ -25,6 +25,9 @@ const here = fileURLToPath(new URL('.', import.meta.url));
 const TEXT_MAX_BYTES = 65_536;
 const SCREENSHOT_CAPS = { max: 4, max_bytes: 524_288 };
 const IMAGE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+/** A screenshot's long side is at most 1440 and its short side at least 800 (reference/gate.json). */
+const SHOT_LONG_MAX = 1440;
+const SHOT_SHORT_MIN = 800;
 
 /** --name <value> out of the arguments, or the fallback. */
 function arg(name: string, fallback: string): string {
@@ -75,9 +78,44 @@ if (shots.length < 3) {
   process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3, the board, a detail view and a filtered view\n`);
   process.exit(1);
 }
+if (shots.length > SCREENSHOT_CAPS.max) {
+  process.stderr.write(`token radar: screenshots/ holds ${shots.length} images, over the ${SCREENSHOT_CAPS.max} the gate takes\n`);
+  process.exit(1);
+}
 for (const name of shots) {
   if (!IMAGE_NAME.test(name)) {
     process.stderr.write(`token radar: screenshots/${name}: a name is letters, digits and . _ -, 1 to 128 characters\n`);
+    process.exit(1);
+  }
+}
+
+/** A PNG's pixel size out of its IHDR chunk, or null when the bytes are not a PNG. */
+function pngSize(bytes: Uint8Array): { width: number; height: number } | null {
+  const magic = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (bytes.length < 24) return null;
+  for (let i = 0; i < 8; i++) if (bytes[i] !== magic[i]) return null;
+  const width = (bytes[16]! << 24) | (bytes[17]! << 16) | (bytes[18]! << 8) | bytes[19]!;
+  const height = (bytes[20]! << 24) | (bytes[21]! << 16) | (bytes[22]! << 8) | bytes[23]!;
+  return { width, height };
+}
+
+/** Every screenshot the gate takes: a PNG of the right size and shape, under the byte cap. */
+for (const name of shots) {
+  const path = join(out, 'screenshots', name);
+  const bytes = readFileSync(path);
+  if (bytes.length > SCREENSHOT_CAPS.max_bytes) {
+    process.stderr.write(`token radar: screenshots/${name} is ${bytes.length} bytes, over the ${SCREENSHOT_CAPS.max_bytes} the gate takes\n`);
+    process.exit(1);
+  }
+  const size = pngSize(bytes);
+  if (size === null) {
+    process.stderr.write(`token radar: screenshots/${name} is not a PNG: hand in PNG screenshots of the dashboard\n`);
+    process.exit(1);
+  }
+  const long = Math.max(size.width, size.height);
+  const short = Math.min(size.width, size.height);
+  if (long > SHOT_LONG_MAX || short < SHOT_SHORT_MIN) {
+    process.stderr.write(`token radar: screenshots/${name} is ${size.width}x${size.height}: the long side is at most ${SHOT_LONG_MAX} and the short side at least ${SHOT_SHORT_MIN}\n`);
     process.exit(1);
   }
 }
