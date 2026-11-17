@@ -1,10 +1,12 @@
 // Token Radar's entry program (Node 22, standard library only).
 //
-// It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), scores every
-// rankable pre-token protocol with the radar-3 model in lib/model.ts, writes the ranked board to
+// It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits the radar-4
+// model on the snapshot's own live-token protocols in lib/model.ts, writes the ranked board to
 // /output/board.json, writes the dashboard's data beside the page as data.js, copies this
-// repository's dashboard/ and screenshots/ to /output, and writes /output/dossier.json with
-// buildDossier from vendor/makefun-board.ts, the make.fun dossier library.
+// repository's dashboard/ and screenshots/ to /output, copies RESEARCH.md into the dashboard so
+// the page's research-note link works and the dossier carries it, writes the validation numbers
+// as dashboard/validation.json so the dossier carries them too, and writes /output/dossier.json
+// with buildDossier from vendor/makefun-board.ts, the make.fun dossier library.
 //
 // The dashboard is a static page with no network: dashboard/index.html, dashboard/app.css and
 // dashboard/app.js read the data.js this program writes. The board is the whole pre-token universe
@@ -73,9 +75,24 @@ function copyFiles(from: string, to: string): string[] {
 }
 
 copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
+const research = join(here, 'RESEARCH.md');
+if (!existsSync(research)) {
+  process.stderr.write('token radar: RESEARCH.md is missing from the repository root\n');
+  process.exit(1);
+}
+copyFileSync(research, join(out, 'dashboard', 'RESEARCH.md'));
+// The validation numbers as a dashboard file, so the dossier's text carries them: the key
+// metrics first, so even a cut dossier keeps them.
+const validationDoc = {
+  model_version: radar.model_version,
+  as_of: radar.as_of,
+  fitted: radar.fitted,
+  validation: radar.validation,
+};
+writeFileSync(join(out, 'dashboard', 'validation.json'), `${JSON.stringify(validationDoc, null, 2)}\n`);
 const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
 if (shots.length < 3) {
-  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3, the board, a detail view and a filtered view\n`);
+  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3, the board, a detail view and the validation view\n`);
   process.exit(1);
 }
 if (shots.length > SCREENSHOT_CAPS.max) {
