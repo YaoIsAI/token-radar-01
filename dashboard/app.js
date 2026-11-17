@@ -44,47 +44,44 @@
     return Math.max(0, Math.round(days)) + 'd';
   }
 
-  // The radar-3 model in one function: the page recomputes a row from the snapshot figures, the
-  // calibration data.js carries and the model constants, and checks the number board.json carries,
-  // so the page's code and the board's data are visibly the same arithmetic. This mirrors
-  // lib/model.ts scoreCore exactly: same terms, same order, same rounding.
+// The radar-4 model in one function: the page recomputes a row from the snapshot figures, the
+  // fitted coefficients data.js carries and the fixed constants, and checks the number board.json
+  // carries, so the page's code and the board's data are visibly the same arithmetic. This mirrors
+  // lib/model.ts scoreCore exactly: same features, same order, same rounding. The check allows a
+  // one-dollar difference: Math.log can differ by a last bit between engines, which can flip a
+  // rounded dollar on a value this size, and a dollar is not a disagreement.
   function impliedOf(row) {
-    var model = DATA.model;
+    var fitted = DATA.fitted;
     var cal = DATA.calibration;
+    var model = DATA.model;
     var age = (row.age_days === null || row.age_days === undefined) ? null : row.age_days;
     var missingAge = age === null;
     var missingGrowth = row.change_7d === null || row.change_7d === undefined;
     var ageScore = age === null ? 0 : 1 - Math.exp(-age / 365);
     var growthScore = missingGrowth ? 0 : Math.tanh(Math.min(model.growth_clamp_pct, Math.max(-model.growth_clamp_pct, row.change_7d)) / model.growth_scale);
     var chainScore = 1 - Math.exp(-Math.log1p((row.chains || []).length) / Math.log(9));
-    // The percentile of log1p(TVL) is the percentile of TVL itself, and raw TVLs are integers:
-    // they compare exactly in every engine, where log1p can differ by a last bit.
-    var grid = cal.tvl_sorted || [];
-    var below = 0, equal = 0;
-    for (var i = 0; i < grid.length; i++) { if (grid[i] < row.tvl_usd) below++; else if (grid[i] === row.tvl_usd) equal++; }
-    var tvlScore = grid.length === 0 ? 0 : (below + 0.5 * equal) / grid.length;
+    var prior = cal.categories[row.category || 'Other'] || { launch_prior: cal.global_launch_rate, value_prior: cal.global_value_log_median };
+    var logV = fitted.value.intercept
+      + fitted.value.log_tvl * Math.log(Math.max(row.tvl_usd, 1))
+      + fitted.value.value_prior * prior.value_prior
+      + fitted.value.age * ageScore
+      + fitted.value.growth * growthScore
+      + fitted.value.chain * chainScore
+      + fitted.value.missing_age * (missingAge ? 1 : 0)
+      - (missingGrowth ? model.missing_growth_penalty : 0);
+    var vConditional = Math.exp(Math.max(-30, Math.min(30, logV)));
     var delay = (age !== null && age > model.delay_threshold_days)
       ? Math.min(model.delay_cap, model.delay_scale * Math.log(age / model.delay_threshold_days))
       : 0;
-    var prior = cal.categories[row.category || 'Other'] || { launch_prior: cal.global_launch_rate, value_prior: cal.global_value_log_median };
-    var logit = model.intercept
-      + model.age_weight * ageScore
-      + model.growth_weight * growthScore
-      + model.chain_weight * chainScore
-      + model.launch_prior_weight * prior.launch_prior
-      - (missingAge ? model.missing_age_penalty : 0)
+    var logit = fitted.launch.intercept
+      + fitted.launch.age * ageScore
+      + fitted.launch.growth * growthScore
+      + fitted.launch.chain * chainScore
+      + fitted.launch.launch_prior * prior.launch_prior
+      + fitted.launch.missing_age * (missingAge ? 1 : 0)
       - (missingGrowth ? model.missing_growth_penalty : 0)
       - delay;
-    var pLaunch = 1 / (1 + Math.exp(-logit));
-    var vConditional = row.tvl_usd * Math.exp(
-      prior.value_prior + model.value_offset
-      + model.value_tvl_weight * tvlScore
-      + model.value_growth_weight * growthScore
-      + model.value_age_weight * ageScore
-      + model.value_chain_weight * chainScore
-      - (missingAge ? model.missing_age_penalty : 0)
-      - (missingGrowth ? model.missing_growth_penalty : 0)
-    );
+    var pLaunch = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, logit))));
     return Math.max(1, Math.round(pLaunch * vConditional));
   }
   // A recompute hook for verification: the page's own arithmetic, callable from the console.
@@ -117,7 +114,7 @@
     var hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
     function get(name) { return q.get(name) || hash.get(name); }
     var view = get('view');
-    if (view === 'detail' || view === 'filtered' || view === 'board') state.view = view;
+    if (view === 'detail' || view === 'filtered' || view === 'board' || view === 'validation') state.view = view;
     var slug = get('slug') || get('p');
     if (slug) { state.selected = slug; state.view = 'detail'; }
     var category = get('category');
@@ -386,18 +383,92 @@
     );
   }
 
+  function fmtNet(n) {
+    if (n === null || n === undefined || !isFinite(n)) return 'n/a';
+    return (n < 0 ? '−$' : '$') + Math.abs(n).toFixed(2);
+  }
+
   function modelPanel() {
-    var m = DATA.model;
+    var f = DATA.fitted;
     var cal = DATA.calibration;
+    var v = DATA.validation;
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed — model ' + DATA.model_version }),
-      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. Both halves are fit by regression on this snapshot’s own ' + v.live_fit_n + ' live-token protocols, at runtime — no coefficient is hand-set except the two the data cannot identify (see the research note). No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
         'implied = round(P_launch x V_conditional)' +
-        '\nP_launch = sigmoid(' + m.intercept + ' + ' + m.age_weight + ' x age + ' + m.growth_weight + ' x growth + ' + m.chain_weight + ' x chains + ' + m.launch_prior_weight + ' x category launch prior − ' + m.missing_age_penalty + ' if age unknown − ' + m.missing_growth_penalty + ' if growth unreported − delay past ' + (m.delay_threshold_days / 365) + 'y)' +
-        '\nV_conditional = TVL x exp(category value prior ' + m.value_offset + ' + ' + m.value_tvl_weight + ' x TVL percentile + ' + m.value_growth_weight + ' x growth + ' + m.value_age_weight + ' x age + ' + m.value_chain_weight + ' x chains − ' + m.missing_age_penalty + ' if age unknown − ' + m.missing_growth_penalty + ' if growth unreported)'
+        '\nlog V_conditional = ' + f.value.intercept.toFixed(2) + ' + ' + f.value.log_tvl.toFixed(2) + ' x log(TVL) + ' + f.value.value_prior.toFixed(2) + ' x category value prior + ' + f.value.age.toFixed(2) + ' x age + ' + f.value.growth.toFixed(2) + ' x growth + ' + f.value.chain.toFixed(2) + ' x chains + ' + f.value.missing_age.toFixed(2) + ' if age unknown − 0.05 if growth unreported' +
+        '\nP_launch = sigmoid(' + f.launch.intercept.toFixed(2) + ' + ' + f.launch.age.toFixed(2) + ' x age + ' + f.launch.growth.toFixed(2) + ' x growth + ' + f.launch.chain.toFixed(2) + ' x chains + ' + f.launch.launch_prior.toFixed(2) + ' x category launch prior + ' + f.launch.missing_age.toFixed(2) + ' if age unknown − 0.05 if growth unreported − delay past 3y)'
       ),
-      el('p', { class: 'sub', text: 'Category priors are calibrated from the ' + cal.live_count + ' live-token protocols in this snapshot (' + cal.live_non_cex_count + ' outside CEX): the launch prior shrinks each category’s live rate toward the global ' + (cal.global_launch_rate * 100).toFixed(1) + '%, and the value prior shrinks each category’s median log(market cap / TVL) toward the global ' + cal.global_value_log_median.toFixed(2) + '. TVL is scored by its percentile of log(1 + TVL), never linearly, and seven-day growth is tanh-clamped at ±' + m.growth_clamp_pct + '% so one spike cannot rule the board. Unknown age or growth is a penalty, never a silent default, and a protocol listed more than three years ago with no token carries a delay penalty. The early radar is every other rankable pre-token protocol, whatever its TVL, and the live-token protocols are set aside with their market caps shown.' })
+      el('p', { class: 'sub', text: 'Category priors are shrunk toward the global rates (' + (cal.global_launch_rate * 100).toFixed(1) + '% launch rate, median log(market cap / TVL) ' + cal.global_value_log_median.toFixed(2) + '). Time-split holdout: Spearman ' + v.time_split.value_spearman.toFixed(2) + ', top-10 hit ' + v.time_split.value_top10_hit + '/' + v.time_split.value_top10_n + ', median log error ' + v.time_split.value_median_abs_log_error.toFixed(2) + ', launch AUC ' + v.time_split.launch_auc.toFixed(2) + '. Full backtest below, and the research note for the method, the assumptions and the limits.' })
+    );
+  }
+
+  function coefTable(title, rows) {
+    var tbody = el('tbody');
+    rows.forEach(function (r) {
+      tbody.appendChild(el('tr', null,
+        el('td', { text: r.name }),
+        el('td', { class: 'num', text: r.fitted.toFixed(2) }),
+        el('td', { class: 'num', text: r.low.toFixed(2) + ' – ' + r.high.toFixed(2) }),
+        el('td', { class: 'num', text: r.median.toFixed(2) })
+      ));
+    });
+    return el('div', { class: 'panel model' },
+      el('h3', { text: title }),
+      el('div', { class: 'table-wrap' },
+        el('table', null,
+          el('thead', null, el('tr', null,
+            el('th', { scope: 'col', text: 'Coefficient' }),
+            el('th', { scope: 'col', text: 'Fitted' }),
+            el('th', { scope: 'col', text: 'Bootstrap range (B = ' + DATA.validation.bootstrap_b + ')' }),
+            el('th', { scope: 'col', text: 'Median' })
+          )),
+          tbody
+        )
+      )
+    );
+  }
+
+  function validationPanel() {
+    var v = DATA.validation;
+    var t = v.time_split, r = v.random_split;
+    function splitRows(s, label) {
+      return [
+        [label + ' — train / test', s.train_n + ' / ' + s.test_n + ' live protocols (cutoff ' + s.cutoff_age_days + ' days)'],
+        [label + ' — value Spearman', s.value_spearman.toFixed(2)],
+        [label + ' — value top-10 hit rate', s.value_top10_hit + ' / ' + s.value_top10_n],
+        [label + ' — value median |log error|', s.value_median_abs_log_error.toFixed(2) + ' (about x' + Math.exp(s.value_median_abs_log_error).toFixed(1) + ')'],
+        [label + ' — launch AUC', s.launch_auc.toFixed(2) + ' (' + s.launch_test_n + ' protocols, ' + s.launch_test_live_n + ' live)']
+      ];
+    }
+    var rows = splitRows(t, 'Time split (oldest 70% fit, newest 30% held out)').concat(splitRows(r, 'Random split (70/30, fixed seed)'));
+    rows.unshift(['In-sample value fit (' + v.live_fit_n + ' live protocols)', 'RMSE (log) ' + v.insample_value_rmse_log.toFixed(2) + ', median |log error| ' + v.insample_value_median_abs_log_error.toFixed(2)]);
+    rows.push(['Holdout coverage', v.known_age_live_n + ' live protocols with a recorded listing date; ' + v.missing_age_live_n + ' live protocols have none and cannot be placed in time, so they are counted here, not hidden.']);
+    var tbody = el('tbody');
+    rows.forEach(function (row) {
+      tbody.appendChild(el('tr', null, el('td', { text: row[0] }), el('td', { class: 'num', text: row[1] })));
+    });
+    var panel = el('section', { class: 'panel model' },
+      el('h2', { text: 'Backtest — does the fitted model predict what it has not seen?' }),
+      el('p', { class: 'sub', text: 'The model is fit on this snapshot’s live-token protocols, then tested on held-out ones it never saw. The time split is the hard test: it fits the oldest 70% and predicts the newest 30%, so it must extrapolate to younger protocols. The random split is the easier test: same distribution, new rows. Read the time split first.' }),
+      el('div', { class: 'table-wrap' },
+        el('table', { class: 'checks' },
+          el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Check' }), el('th', { scope: 'col', text: 'Result' }))),
+          tbody
+        )
+      ),
+      el('p', { class: 'sub', text: 'What the numbers say: the value model orders held-out market caps moderately (Spearman ' + t.value_spearman.toFixed(2) + ' on the time split, ' + r.value_spearman.toFixed(2) + ' on the random split) and its dollar error is wide — a median log error of ' + t.value_median_abs_log_error.toFixed(2) + ' is a factor of about x' + Math.exp(t.value_median_abs_log_error).toFixed(1) + ' on the time split. Treat implied values as an ordering, not a price. The bootstrap ranges below show which coefficients the data actually pins down: log(TVL) and the category value prior are stable; age, growth and chain are not.' })
+    );
+    var wrap = el('div', null, panel, coefTable('Value coefficients — log(market cap)', v.value_bootstrap), coefTable('Launch coefficients — logit of launched-or-not', v.launch_bootstrap));
+    return wrap;
+  }
+
+  function researchSection() {
+    return el('section', { class: 'panel model' },
+      el('h2', { text: 'Research note' }),
+      el('p', { class: 'sub', text: 'The full note — the model, how the coefficients were fit, the holdout results, the farm cost model and its assumptions, the limits, and what the numbers are not — ships with this dashboard as RESEARCH.md, and the validation numbers as validation.json.' }),
+      el('p', null, el('a', { href: 'RESEARCH.md', text: 'Read the research note (RESEARCH.md)' }), el('span', { class: 'sub', text: ' · ' }), el('a', { href: 'validation.json', text: 'Validation numbers (validation.json)' }))
     );
   }
 
@@ -417,7 +488,7 @@
     writeHash();
     dialog.textContent = '';
     var m = row.model;
-    var plan = row.farm_plan || { capital_usd: 0, setup_cost_usd: 0, weekly_cost_usd: 0, hold_days: 0, exit_steps: [], risk_flags: [] };
+    var plan = row.farm_plan || { capital_usd: 0, setup_cost_usd: 0, weekly_cost_usd: 0, hold_days: 0, weeks: 0, net_cost_usd: 0, sunk_cost_usd: 0, expected_gross_usd: 0, expected_net_usd: 0, exit_steps: [], risk_flags: [] };
     var steps = row.farm_steps || [];
     var recomputed = impliedOf(row);
     dialog.appendChild(el('div', { class: 'detail-head' },
@@ -440,7 +511,7 @@
         el('div', null, el('span', { text: 'Confidence band' }), el('b', { class: 'num', text: fmtUsd(m.implied_low) + ' – ' + fmtUsd(m.implied_high) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Band: TVL ±30% and 7d growth ±20% through the same function. Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (recomputed === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate of what a launch could be worth, not a market-cap promise.' })
+      el('p', { class: 'sub', text: 'Band: TVL ±30% and 7d growth ±20% through the same function. Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (Math.abs(recomputed - row.implied_value_usd) <= 1 ? ', the same number board.json carries (to the dollar).' : ', which differs from the board: the data would be stale.') + ' This is an estimate of what a launch could be worth, not a market-cap promise.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'What drives the score' }),
@@ -457,13 +528,16 @@
       el('p', { class: 'sub', text: 'Data quality: ' + qualityText(m) })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
-      el('h3', { text: 'Farm plan — money' }),
+      el('h3', { text: 'Farm plan — money, netted to the dollar' }),
       el('div', { class: 'equation' },
-        el('div', null, el('span', { text: 'Capital' }), el('b', { class: 'num', text: '$' + plan.capital_usd })),
-        el('div', null, el('span', { text: 'One-time setup cost' }), el('b', { class: 'num', text: 'about $' + plan.setup_cost_usd })),
-        el('div', null, el('span', { text: 'Ongoing cost' }), el('b', { class: 'num', text: 'about $' + plan.weekly_cost_usd + ' a week' })),
+        el('div', null, el('span', { text: 'Net cost to run' }), el('b', { class: 'num', text: fmtNet(plan.net_cost_usd) })),
+        el('div', null, el('span', { text: 'Capital (returned on exit)' }), el('b', { class: 'num', text: '$' + plan.capital_usd })),
+        el('div', null, el('span', { text: 'Spent: setup + weekly gas' }), el('b', { class: 'num', text: fmtNet(plan.sunk_cost_usd) + ' over ' + plan.weeks + ' weeks' })),
+        el('div', null, el('span', { text: 'Expected gross (pro-rata share)' }), el('b', { class: 'num', text: fmtNet(plan.expected_gross_usd) })),
+        el('div', null, el('span', { text: 'Expected net' }), el('b', { class: 'num', text: fmtNet(plan.expected_net_usd) })),
         el('div', null, el('span', { text: 'Minimum hold' }), el('b', { class: 'num', text: plan.hold_days + ' days' }))
       ),
+      el('p', { class: 'sub', text: 'Expected gross = launch probability x conditional value x (capital / TVL): it assumes any future token is distributed pro-rata to TVL share. The snapshot carries no airdrop terms, so this is a scenario, not a promise — a $50–$250 position in a $50M+ protocol is a dust share, and the expected net is usually negative. Full assumption in the research note.' }),
       el('h3', { text: 'Exit' }),
       el('ol', { class: 'steps' }, (plan.exit_steps || []).map(function (s) { return el('li', null, el('b', { text: s })); })),
       el('h3', { text: 'Risk flags' }),
@@ -526,10 +600,18 @@
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
     shell.appendChild(lede());
+    if (state.view === 'validation') {
+      shell.appendChild(validationPanel());
+      shell.appendChild(researchSection());
+      shell.appendChild(el('p', { class: 'footnote', text: 'Implied values are this radar’s own model, not a promise and not a price. A protocol records no token in the snapshot; that is DefiLlama’s record, not proof it has none. Source: ' + DATA.source + '.' }));
+      app.appendChild(shell);
+      app.setAttribute('aria-busy', 'false');
+      return;
+    }
     if (state.view !== 'detail') shell.appendChild(spotlight());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    if (state.tab === 'pre-token') shell.appendChild(modelPanel());
+    if (state.tab === 'pre-token') { shell.appendChild(modelPanel()); shell.appendChild(validationPanel()); shell.appendChild(researchSection()); }
     shell.appendChild(el('p', { class: 'footnote', text: 'Implied values are this radar’s own model, not a promise and not a price. A protocol records no token in the snapshot; that is DefiLlama’s record, not proof it has none. Source: ' + DATA.source + '.' }));
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');

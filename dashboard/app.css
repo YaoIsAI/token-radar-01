@@ -127,6 +127,15 @@ tbody tr[data-selected="true"] { background: var(--surface-2); box-shadow: inset
 .equation { display: grid; gap: var(--s2); font-family: var(--font-num); font-size: 13px; }
 .equation div { display: flex; justify-content: space-between; gap: var(--s3); }
 .equation span { color: var(--muted); }
+/* The first row of a farm money block is the headline: net cost to run the plan. */
+.equation div:first-child { font-size: 16px; font-weight: 600; padding-bottom: var(--s2); border-bottom: 1px solid var(--border); }
+.equation div:first-child b { color: var(--ink); }
+/* Validation panel coefficient tables share the model panel's spacing. */
+.model h3 { font-size: 15px; }
+.model .table-wrap { overflow-x: auto; }
+/* The backtest check table: the label column needs room, or the check names wrap to ribbons. */
+.checks { table-layout: fixed; width: 100%; }
+.checks th:first-child, .checks td:first-child { width: 42%; }
 .steps { margin: 0; padding-left: var(--s5); display: grid; gap: var(--s3); }
 .steps li { padding-left: var(--s1); }
 .steps b { display: block; font-weight: 500; }
