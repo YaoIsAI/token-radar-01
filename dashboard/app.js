@@ -55,9 +55,6 @@
     var logV = fitted.value.intercept
       + fitted.value.log_tvl * Math.log(Math.max(row.tvl_usd, 1))
       + fitted.value.value_prior * prior.value_prior
-      + fitted.value.growth * growthScore
-      + fitted.value.chain * chainScore
-      + fitted.value.missing_age * (missingAge ? 1 : 0)
       - (missingGrowth ? model.missing_growth_penalty : 0);
     var vConditional = Math.exp(Math.max(-30, Math.min(30, logV)));
     var delay = (age !== null && age > model.delay_threshold_days)
@@ -393,10 +390,10 @@
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. Both halves are fit by regression on this snapshot’s own ' + v.live_fit_n + ' live-token protocols, at runtime — no coefficient is hand-set except the two the data cannot identify (see the research note). No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
         'implied = round(P_launch x V_conditional)' +
-        '\nlog V_conditional = ' + f.value.intercept.toFixed(2) + ' + ' + f.value.log_tvl.toFixed(2) + ' x log(TVL) + ' + f.value.value_prior.toFixed(2) + ' x category value prior + ' + f.value.growth.toFixed(2) + ' x growth + ' + f.value.chain.toFixed(2) + ' x chains + ' + f.value.missing_age.toFixed(2) + ' if age unknown − 0.05 if growth unreported' +
+        '\nlog V_conditional = ' + f.value.intercept.toFixed(2) + ' + ' + f.value.log_tvl.toFixed(2) + ' x log(TVL) + ' + f.value.value_prior.toFixed(2) + ' x category value prior − 0.05 if growth unreported' +
         '\nP_launch = sigmoid(' + f.launch.intercept.toFixed(2) + ' + ' + f.launch.age.toFixed(2) + ' x age + ' + f.launch.growth.toFixed(2) + ' x growth + ' + f.launch.chain.toFixed(2) + ' x chains + ' + f.launch.launch_prior.toFixed(2) + ' x category launch prior + ' + f.launch.missing_age.toFixed(2) + ' if age unknown − 0.05 if growth unreported − delay past 3y)'
       ),
-      el('p', { class: 'sub', text: 'Both halves are ridge regressions fit at runtime (value ridge ' + v.ridge.value_lambda + ', launch ridge ' + v.ridge.launch_lambda + ', each chosen by five-fold cross-validation). Age is not a value feature any more: it broke the time-split ranking in the last version. A row’s P_launch comes from the fold model trained without that row (5-fold cross-fit, fold priors of its own); the launch line above is the full fit, for reference, and the five fold fits are in validation.json.' }),
+      el('p', { class: 'sub', text: 'Both halves are ridge regressions fit at runtime (value ridge ' + v.ridge.value_lambda + ', launch ridge ' + v.ridge.launch_lambda + ', each chosen by five-fold cross-validation). The value half keeps only the two coefficients the data pins down — log(TVL) and the category value prior. Age left this half in the last version; growth, chains and the age-unknown flag left in this one (their bootstrap ranges cross zero and the ablation shows they cost ranking quality on every holdout). A row’s P_launch comes from the fold model trained without that row (5-fold cross-fit, fold priors of its own); the launch line above is the full fit, for reference, and the five fold fits are in validation.json.' }),
       el('p', { class: 'sub', text: 'Category priors are shrunk toward the global rates (' + (cal.global_launch_rate * 100).toFixed(1) + '% launch rate, median log(market cap / TVL) ' + cal.global_value_log_median.toFixed(2) + '). Time-split holdout: Spearman ' + v.time_split.value_spearman.toFixed(2) + ', top-10 hit ' + v.time_split.value_top10_hit + '/' + v.time_split.value_top10_n + ', median log error ' + v.time_split.value_median_abs_log_error.toFixed(2) + ', launch AUC ' + v.time_split.launch_auc.toFixed(2) + '. Expanding-window mean Spearman ' + v.expanding_window.mean_spearman.toFixed(2) + '; out-of-fold value Spearman ' + v.oof.value_spearman.toFixed(2) + ', launch AUC ' + v.oof.launch_auc.toFixed(2) + '. Full backtest below, and the research note for the method, the assumptions and the limits.' })
     );
   }
@@ -459,7 +456,7 @@
           tbody
         )
       ),
-      el('p', { class: 'sub', text: 'What the numbers say: the value model orders held-out market caps moderately (Spearman ' + t.value_spearman.toFixed(2) + ' on the time split, ' + r.value_spearman.toFixed(2) + ' on the random split, ' + v.oof.value_spearman.toFixed(2) + ' out-of-fold) and its dollar error is wide — a median log error of ' + t.value_median_abs_log_error.toFixed(2) + ' is a factor of about x' + Math.exp(t.value_median_abs_log_error).toFixed(1) + ' on the time split. The youngest era is still unrankable: the expanding window’s last fold, the newest 19 protocols, scores near zero for every variant tried. Treat implied values as an ordering, not a price. The bootstrap ranges below show which coefficients the data actually pins down: log(TVL) and the category value prior are stable; growth and chain are not.' })
+      el('p', { class: 'sub', text: 'What the numbers say: the value model orders held-out market caps moderately (Spearman ' + t.value_spearman.toFixed(2) + ' on the time split, ' + r.value_spearman.toFixed(2) + ' on the random split, ' + v.oof.value_spearman.toFixed(2) + ' out-of-fold) and its dollar error is wide — a median log error of ' + t.value_median_abs_log_error.toFixed(2) + ' is a factor of about x' + Math.exp(t.value_median_abs_log_error).toFixed(1) + ' on the time split. The youngest era is still unrankable: the expanding window’s last fold, the newest 19 protocols, scores near zero for every variant tried. Treat implied values as an ordering, not a price. The value model keeps only the two coefficients the bootstrap pins down; the rest were dropped for costing ranking quality on every holdout.' })
     );
     var wrap = el('div', null, panel, coefTable('Value coefficients — log(market cap)', v.value_bootstrap), coefTable('Launch coefficients — logit of launched-or-not', v.launch_bootstrap));
     return wrap;
