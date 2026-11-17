@@ -1,4 +1,4 @@
-// Token Radar's model, radar-3: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model, radar-4: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds
 // every other pre-token protocol the house's own rule would keep: a protocol is rankable when it
@@ -15,30 +15,38 @@
 // toward the launch prior, but it cannot enter a log(market cap / TVL) median and is left out
 // there.
 //
-// Implied value is a launch probability times a conditional value, both calibrated from the
-// snapshot's own 129 live-token protocols, and the same function scores every row; no protocol
-// name is ever special-cased:
+// Implied value is a launch probability times a conditional value, and the same function scores
+// every row; no protocol name is ever special-cased. radar-4 fits both halves by regression on
+// the snapshot's own 129 live-token protocols, at runtime, from the sealed input — no coefficient
+// is hand-set any more except the two the data cannot identify (see below):
 //
-//   age_score    = 1 - exp(-age_days / 365); 0 when the age is unknown, plus a penalty below
-//   growth_score = tanh(clamp(change_7d, -30, 30) / 20); 0 when growth is unreported, plus a penalty
-//   chain_score  = 1 - exp(-ln(1 + chains) / ln(9))
-//   tvl_score    = the percentile of log1p(tvl_usd) inside the ranked set (never a linear TVL)
-//   delay        = min(0.15, 0.10 x ln(age_days / 1095)) once a protocol has run three years with
-//                  no token; 0 before that, and 0 when the age is unknown
-//   launch_prior = (live in the category + 10 x global live rate) / (protocols in the category + 10)
-//   value_prior  = the same shrinkage over the category's median log(market cap / TVL)
-//   P_launch     = sigmoid(-0.60 + 0.30 x age + 0.20 x growth + 0.10 x chains + 0.40 x launch_prior
-//                          - 0.10 when the age is unknown - 0.05 when growth is unreported - delay)
-//   V_conditional = tvl_usd x exp(value_prior - 0.45 + 0.20 x tvl + 0.20 x growth + 0.15 x age
-//                          + 0.10 x chains - 0.10 when the age is unknown - 0.05 when growth is
-//                          unreported)
-//   implied      = max(1, round(P_launch x V_conditional))
+//   value:  log(market cap) is fit by ordinary least squares on the live protocols, on
+//           [1, log(TVL), category value prior, age score, growth score, chain score,
+//            missing-age flag]. V_conditional is exp(that prediction).
+//   launch: launched-or-not is fit by logistic regression (iteratively reweighted least squares)
+//           on all 758 protocols, on [1, age score, growth score, chain score, category launch
+//           prior, missing-age flag]. P_launch is the sigmoid of that logit, less a delay penalty
+//           for protocols listed more than three years ago with no token.
+//   implied = max(1, round(P_launch x V_conditional))
 //
-// The band around a row recomputes the same function with TVL at 70% and 130% and seven-day growth
-// at 80% and 120%: it is a sensitivity range, not a second model. Drivers are the three largest
-// signed contributions to the score; risks name what is missing, extreme, concentrated or weakly
-// calibrated. The dashboard states the formula, carries the calibration, and recomputes every row
-// from the same figures, so the page and board.json agree.
+// The two numbers the data cannot identify stay fixed constants, and the research note says why:
+// the missing-growth penalty (no live protocol is missing seven-day growth, so no regression can
+// price it; four protocols in the whole snapshot are missing it, all pre-token, so a fitted flag
+// would separate them outright) and the delay penalty (a structural correction for the censoring
+// in "launched by now": a protocol observed old and tokenless has already survived the usual
+// launch window, which a regression on current status cannot see on its own).
+//
+// The fit is validated at runtime, on the same snapshot, and the numbers are on the dashboard and
+// in validation.json: a TIME split (the oldest 70% of the live protocols with a recorded listing
+// date fit the model, the newest 30% are held out), a RANDOM 70/30 split of the same set, and a
+// bootstrap (B = 200, fixed seed) that refits both regressions on resampled data and reports each
+// coefficient's range. 34 live protocols have no listing date and cannot be placed in time, so
+// the holdout covers the 95 with one; the note says so. The band around a row recomputes the same
+// function with TVL at 70% and 130% and seven-day growth at 80% and 120%: it is a sensitivity
+// range, not a second model. Drivers are the three largest signed contributions to the score;
+// risks name what is missing, extreme, concentrated or weakly calibrated. The dashboard states
+// the formula, carries the fitted coefficients and the validation, and recomputes every row from
+// the same figures, so the page and board.json agree to the dollar.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -63,23 +71,12 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-/** The model's constants, as the dashboard states them. */
+/** The model's fixed constants: the two the data cannot identify, and the data cleaning. */
 export interface ModelConstants {
-  intercept: number;
-  age_weight: number;
-  growth_weight: number;
-  chain_weight: number;
-  launch_prior_weight: number;
-  missing_age_penalty: number;
   missing_growth_penalty: number;
   delay_threshold_days: number;
   delay_scale: number;
   delay_cap: number;
-  value_offset: number;
-  value_tvl_weight: number;
-  value_growth_weight: number;
-  value_age_weight: number;
-  value_chain_weight: number;
   shrink_k: number;
   growth_clamp_pct: number;
   growth_scale: number;
@@ -90,21 +87,10 @@ export interface ModelConstants {
 }
 
 export const MODEL: ModelConstants = {
-  intercept: -0.6,
-  age_weight: 0.3,
-  growth_weight: 0.2,
-  chain_weight: 0.1,
-  launch_prior_weight: 0.4,
-  missing_age_penalty: 0.1,
   missing_growth_penalty: 0.05,
   delay_threshold_days: 1095,
   delay_scale: 0.1,
   delay_cap: 0.15,
-  value_offset: -0.45,
-  value_tvl_weight: 0.2,
-  value_growth_weight: 0.2,
-  value_age_weight: 0.15,
-  value_chain_weight: 0.1,
   shrink_k: 10,
   growth_clamp_pct: 30,
   growth_scale: 20,
@@ -115,7 +101,72 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
+
+/** The fitted value regression: log(market cap) on the features, in this order. */
+export interface FittedValue {
+  intercept: number;
+  log_tvl: number;
+  value_prior: number;
+  age: number;
+  growth: number;
+  chain: number;
+  missing_age: number;
+}
+
+/** The fitted launch regression: the logit of launched-or-not, in this order. */
+export interface FittedLaunch {
+  intercept: number;
+  age: number;
+  growth: number;
+  chain: number;
+  launch_prior: number;
+  missing_age: number;
+}
+
+/** Both fitted halves, as the dashboard recomputes a row from them. */
+export interface FittedModel {
+  value: FittedValue;
+  launch: FittedLaunch;
+}
+
+/** One fitted coefficient with its bootstrap range. */
+export interface CoefficientRange {
+  name: string;
+  fitted: number;
+  low: number;
+  high: number;
+  median: number;
+}
+
+/** One holdout split's metrics: the value rank and error, and the launch rank. */
+export interface SplitMetrics {
+  train_n: number;
+  test_n: number;
+  cutoff_age_days: number;
+  value_spearman: number;
+  value_top10_hit: number;
+  value_top10_n: number;
+  value_median_abs_log_error: number;
+  launch_auc: number;
+  launch_test_n: number;
+  launch_test_live_n: number;
+}
+
+/** The runtime validation: both splits, the in-sample fit, and the bootstrap ranges. */
+export interface Validation {
+  live_fit_n: number;
+  known_age_live_n: number;
+  missing_age_live_n: number;
+  insample_value_rmse_log: number;
+  insample_value_median_abs_log_error: number;
+  time_split: SplitMetrics;
+  random_split: SplitMetrics;
+  bootstrap_b: number;
+  bootstrap_seed: number;
+  value_bootstrap: CoefficientRange[];
+  launch_bootstrap: CoefficientRange[];
+}
 
 /** One category's calibrated priors: how often its protocols launch, and what they are worth. */
 export interface CategoryPrior {
@@ -134,9 +185,10 @@ export interface Calibration {
   global_value_log_median: number;
   shrink_k: number;
   categories: Record<string, CategoryPrior>;
-  // The ranked set's TVLs, sorted: the percentile of log1p(TVL) is the percentile of TVL itself
-  // (log1p is monotone), and raw TVLs are integers, so they compare exactly in every engine —
-  // log1p itself can differ by a last bit between engines, which once flipped a tied percentile.
+  // The ranked set's TVLs, sorted: a descriptive percentile for the driver lines only — the
+  // fitted value model reads log(TVL) itself, never this grid. Raw TVLs are integers, so they
+  // compare exactly in every engine; log1p itself can differ by a last bit between engines,
+  // which once flipped a tied percentile.
   tvl_sorted: number[];
 }
 
@@ -153,6 +205,15 @@ export interface FarmPlan {
   setup_cost_usd: number;
   weekly_cost_usd: number;
   hold_days: number;
+  weeks: number;
+  /** All cash committed: capital + setup + weekly cost x weeks. The capital comes back on exit. */
+  net_cost_usd: number;
+  /** Cash actually spent: setup + weekly cost x weeks. The capital is returned on exit. */
+  sunk_cost_usd: number;
+  /** The expected value of the farmer's share of a future token, probability-weighted. */
+  expected_gross_usd: number;
+  /** Expected profit: expected gross less the sunk cost. Usually negative; see the research note. */
+  expected_net_usd: number;
   exit_steps: string[];
   risk_flags: string[];
 }
@@ -236,6 +297,8 @@ export interface RadarData {
   floor_usd: number;
   model: ModelConstants;
   model_version: string;
+  fitted: FittedModel;
+  validation: Validation;
   watchlist_size: number;
   watchlist_covered: number;
   watchlist: string[];
@@ -273,6 +336,7 @@ function median(values: number[]): number {
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+const round2 = (n: number): number => Math.round(n * 100) / 100;
 
 /** A dollar figure in short form, for a driver line. */
 function shortUsd(n: number): string {
@@ -312,21 +376,29 @@ export function isLive(p: SnapshotProtocol): boolean {
   return p.mcap_usd !== null && p.mcap_usd !== 0;
 }
 
+/** The live protocols a log(market cap) regression can read: a positive market cap and TVL. */
+function fitLive(snapshot: Snapshot): SnapshotProtocol[] {
+  return snapshot.protocols.filter((p) => isLive(p) && p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+}
+
 /**
  * The calibration: each category's launch and value priors, shrunk toward the global rates with a
  * pseudo-count of `shrink_k`, so a category with one live protocol barely moves off the global.
- * The TVL percentile grid is filled in by buildBoard once the ranked set is known.
+ * `pool` is the protocol set the priors are read from: the whole snapshot for the shipped model,
+ * the training era only for a holdout fit, so a holdout never sees its own test set's labels. The
+ * TVL percentile grid is filled in by buildBoard once the ranked set is known.
  */
-export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Calibration {
-  const live = snapshot.protocols.filter(isLive);
+export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL, pool: SnapshotProtocol[] | null = null): Calibration {
+  const set = pool ?? snapshot.protocols;
+  const live = set.filter(isLive);
   const liveNonCex = live.filter((p) => p.category !== 'CEX');
-  const globalLaunchRate = snapshot.protocols.length > 0 ? live.length / snapshot.protocols.length : 0;
+  const globalLaunchRate = set.length > 0 ? live.length / set.length : 0;
   const logRatios = live
     .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0)
     .map((p) => Math.log(p.mcap_usd! / p.tvl_usd));
   const globalValueMedian = median(logRatios);
   const byCat = new Map<string, SnapshotProtocol[]>();
-  for (const p of snapshot.protocols) {
+  for (const p of set) {
     const key = p.category ?? 'Other';
     const arr = byCat.get(key);
     if (arr !== undefined) arr.push(p);
@@ -358,6 +430,382 @@ export function calibrate(snapshot: Snapshot, model: ModelConstants = MODEL): Ca
   };
 }
 
+/** A category's priors, falling back to the global rates when the category is unseen. */
+function priorOf(cal: Calibration, category: string | null): CategoryPrior {
+  return cal.categories[category ?? 'Other'] ?? {
+    live: 0,
+    total: 0,
+    launch_prior: cal.global_launch_rate,
+    value_prior: cal.global_value_log_median,
+    value_samples: 0,
+  };
+}
+
+/** The feature transforms the regressions share: age, growth and chain scores, 0 when unreported. */
+function ageScore(age: number | null): number {
+  return age === null ? 0 : 1 - Math.exp(-age / 365);
+}
+function growthScore(change7d: number | null, model: ModelConstants): number {
+  return change7d === null
+    ? 0
+    : Math.tanh(Math.min(model.growth_clamp_pct, Math.max(-model.growth_clamp_pct, change7d)) / model.growth_scale);
+}
+function chainScore(chains: number): number {
+  return 1 - Math.exp(-Math.log1p(chains) / Math.log(9));
+}
+
+/** The value regression's feature row: [1, log TVL, value prior, age, growth, chain, missing age]. */
+function valueFeatures(p: SnapshotProtocol, asOf: string, cal: Calibration, model: ModelConstants, tvlMult = 1, growthMult = 1): number[] {
+  const age = ageDays(asOf, p.listed_at);
+  const prior = priorOf(cal, p.category);
+  return [
+    1,
+    Math.log(Math.max(p.tvl_usd * tvlMult, 1)),
+    prior.value_prior,
+    ageScore(age),
+    growthScore(p.change_7d === null ? null : p.change_7d * growthMult, model),
+    chainScore(p.chains.length),
+    age === null ? 1 : 0,
+  ];
+}
+
+/** The launch regression's feature row: [1, age, growth, chain, launch prior, missing age]. */
+function launchFeatures(p: SnapshotProtocol, asOf: string, cal: Calibration, model: ModelConstants): number[] {
+  const age = ageDays(asOf, p.listed_at);
+  const prior = priorOf(cal, p.category);
+  return [
+    1,
+    ageScore(age),
+    growthScore(p.change_7d, model),
+    chainScore(p.chains.length),
+    prior.launch_prior,
+    age === null ? 1 : 0,
+  ];
+}
+
+/** A deterministic generator: mulberry32, so a bootstrap's resamples are the same every run. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Gaussian elimination with partial pivoting; solves A x = b. Every fit in this file goes through
+ * it, so a fit is a pure function of its rows: same rows, same coefficients, every run.
+ */
+function solve(A: number[][], b: number[]): number[] {
+  const n = b.length;
+  const m = A.map((row, i) => [...row, b[i]!]);
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(m[r]![c]!) > Math.abs(m[piv]![c]!)) piv = r;
+    if (Math.abs(m[piv]![c]!) < 1e-12) throw new Error('singular system');
+    const tmp = m[c]!;
+    m[c] = m[piv]!;
+    m[piv] = tmp;
+    for (let r = c + 1; r < n; r++) {
+      const f = m[r]![c]! / m[c]![c]!;
+      for (let k = c; k <= n; k++) m[r]![k]! -= f * m[c]![k]!;
+    }
+  }
+  const x = new Array<number>(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let s = m[r]![n]!;
+    for (let k = r + 1; k < n; k++) s -= m[r]![k]! * x[k]!;
+    x[r] = s / m[r]![r]!;
+  }
+  return x;
+}
+
+/** Ordinary least squares by the normal equations, with a hair of ridge for stability. */
+function ols(X: number[][], y: number[]): number[] {
+  const k = X[0]!.length;
+  const A: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  const b = new Array<number>(k).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let a = 0; a < k; a++) {
+      b[a]! += X[i]![a]! * y[i]!;
+      for (let c = 0; c < k; c++) A[a]![c]! += X[i]![a]! * X[i]![c]!;
+    }
+  }
+  for (let a = 0; a < k; a++) A[a]![a]! += 1e-9;
+  return solve(A, b);
+}
+
+/**
+ * Logistic regression by iteratively reweighted least squares: the logit is fit, the weights are
+ * the fitted probabilities' variance, and the loop stops when no coefficient moves by more than
+ * 1e-9, or after 25 rounds. A hair of ridge keeps a near-separated feature solvable.
+ */
+function logistic(X: number[][], y: number[]): number[] {
+  const k = X[0]!.length;
+  let beta = new Array<number>(k).fill(0);
+  for (let it = 0; it < 25; it++) {
+    const A: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+    const b = new Array<number>(k).fill(0);
+    for (let i = 0; i < X.length; i++) {
+      const z = Math.max(-30, Math.min(30, X[i]!.reduce((s, v, j) => s + v * beta[j]!, 0)));
+      const p = 1 / (1 + Math.exp(-z));
+      const w = Math.max(p * (1 - p), 1e-6);
+      for (let a = 0; a < k; a++) {
+        b[a]! += X[i]![a]! * ((y[i]! - p) + w * z);
+        for (let c = 0; c < k; c++) A[a]![c]! += w * X[i]![a]! * X[i]![c]!;
+      }
+    }
+    for (let a = 0; a < k; a++) A[a]![a]! += 1e-8;
+    const next = solve(A, b);
+    let moved = 0;
+    for (let j = 0; j < k; j++) moved = Math.max(moved, Math.abs(next[j]! - beta[j]!));
+    beta = next;
+    if (moved < 1e-9) break;
+  }
+  return beta;
+}
+
+/** Spearman's rank correlation, ties averaged: how well a prediction orders the actual values. */
+function spearman(pred: number[], actual: number[]): number {
+  const ranks = (arr: number[]): number[] => {
+    const idx = arr.map((v, i) => [v, i] as const).sort((a, b) => a[0] - b[0]);
+    const r = new Array<number>(arr.length);
+    let i = 0;
+    while (i < idx.length) {
+      let j = i;
+      while (j + 1 < idx.length && idx[j + 1]![0] === idx[i]![0]) j++;
+      const avg = (i + j) / 2 + 1;
+      for (let k = i; k <= j; k++) r[idx[k]![1]!] = avg;
+      i = j + 1;
+    }
+    return r;
+  };
+  const rp = ranks(pred);
+  const ra = ranks(actual);
+  const n = pred.length;
+  const mp = rp.reduce((s, v) => s + v, 0) / n;
+  const ma = ra.reduce((s, v) => s + v, 0) / n;
+  let num = 0;
+  let dp = 0;
+  let da = 0;
+  for (let i = 0; i < n; i++) {
+    num += (rp[i]! - mp) * (ra[i]! - ma);
+    dp += (rp[i]! - mp) ** 2;
+    da += (ra[i]! - ma) ** 2;
+  }
+  if (dp === 0 || da === 0) return 0;
+  return num / Math.sqrt(dp * da);
+}
+
+/** The area under the ROC curve, ties counted half: how well a score ranks the launched ones. */
+function auc(scores: number[], labels: number[]): number {
+  const pos = scores.filter((_, i) => labels[i] === 1);
+  const neg = scores.filter((_, i) => labels[i] === 0);
+  if (pos.length === 0 || neg.length === 0) return 0;
+  let wins = 0;
+  for (const p of pos) for (const n of neg) wins += p > n ? 1 : p === n ? 0.5 : 0;
+  return wins / (pos.length * neg.length);
+}
+
+/** The fitted halves, from the snapshot's own live protocols and the whole protocol set. */
+export function fitModel(snapshot: Snapshot, cal: Calibration, model: ModelConstants = MODEL): FittedModel {
+  const live = fitLive(snapshot);
+  const bv = ols(live.map((p) => valueFeatures(p, snapshot.as_of, cal, model)), live.map((p) => Math.log(p.mcap_usd!)));
+  const bl = logistic(snapshot.protocols.map((p) => launchFeatures(p, snapshot.as_of, cal, model)), snapshot.protocols.map((p) => (isLive(p) ? 1 : 0)));
+  return {
+    value: {
+      intercept: bv[0]!,
+      log_tvl: bv[1]!,
+      value_prior: bv[2]!,
+      age: bv[3]!,
+      growth: bv[4]!,
+      chain: bv[5]!,
+      missing_age: bv[6]!,
+    },
+    launch: {
+      intercept: bl[0]!,
+      age: bl[1]!,
+      growth: bl[2]!,
+      chain: bl[3]!,
+      launch_prior: bl[4]!,
+      missing_age: bl[5]!,
+    },
+  };
+}
+
+/** One split's metrics, from a fitted pair applied to its held-out set. */
+function splitMetrics(
+  valueBeta: number[],
+  launchBeta: number[],
+  testLive: SnapshotProtocol[],
+  testAll: SnapshotProtocol[],
+  snapshot: Snapshot,
+  cal: Calibration,
+  model: ModelConstants,
+  cutoffAge: number,
+): SplitMetrics {
+  const pred = testLive.map((p) => valueFeatures(p, snapshot.as_of, cal, model).reduce((s, v, j) => s + v * valueBeta[j]!, 0));
+  const actual = testLive.map((p) => Math.log(p.mcap_usd!));
+  const topActual = new Set(
+    actual.map((v, i) => [v, i] as const).sort((a, b) => b[0] - a[0]).slice(0, 10).map(([, i]) => i),
+  );
+  const topPred = new Set(
+    pred.map((v, i) => [v, i] as const).sort((a, b) => b[0] - a[0]).slice(0, 10).map(([, i]) => i),
+  );
+  let hit = 0;
+  for (const i of topActual) if (topPred.has(i)) hit++;
+  const scores = testAll.map((p) => {
+    const z = launchFeatures(p, snapshot.as_of, cal, model).reduce((s, v, j) => s + v * launchBeta[j]!, 0);
+    return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
+  });
+  return {
+    train_n: 0,
+    test_n: testLive.length,
+    cutoff_age_days: cutoffAge,
+    value_spearman: round4(spearman(pred, actual)),
+    value_top10_hit: hit,
+    value_top10_n: 10,
+    value_median_abs_log_error: round4(median(actual.map((y, i) => Math.abs(y - pred[i]!)))),
+    launch_auc: round4(auc(scores, testAll.map((p) => (isLive(p) ? 1 : 0)))),
+    launch_test_n: testAll.length,
+    launch_test_live_n: testAll.filter(isLive).length,
+  };
+}
+
+/**
+ * The runtime validation: a time split, a random split and a bootstrap, all from the sealed
+ * snapshot. The splits cover only the live protocols with a recorded listing date — 34 live
+ * protocols have none and cannot be placed in time, so they are counted here, not hidden. The
+ * random split uses the same fixed seed as the bootstrap, and the bootstrap refits both
+ * regressions on resampled data with the priors held fixed, so its ranges measure the
+ * regressions' own sampling wobble, not the priors'.
+ */
+export function validateModel(snapshot: Snapshot, cal: Calibration, model: ModelConstants = MODEL): Validation {
+  const live = fitLive(snapshot);
+  const knownLive = live.filter((p) => ageDays(snapshot.as_of, p.listed_at) !== null);
+  const missingAgeLive = live.length - knownLive.length;
+  const seed = 20261117;
+  const rnd = mulberry32(seed);
+
+  // In-sample fit quality, on the same rows the shipped coefficients are fit from.
+  const shipped = fitModel(snapshot, cal, model);
+  const inResid = live.map((p) => {
+    const pred = valueFeatures(p, snapshot.as_of, cal, model).reduce((s, v, j) => s + v * [
+      shipped.value.intercept, shipped.value.log_tvl, shipped.value.value_prior, shipped.value.age,
+      shipped.value.growth, shipped.value.chain, shipped.value.missing_age,
+    ][j]!, 0);
+    return Math.log(p.mcap_usd!) - pred;
+  });
+  const insampleRmse = Math.sqrt(inResid.reduce((s, r) => s + r * r, 0) / inResid.length);
+  const insampleMed = median(inResid.map(Math.abs));
+
+  // The time split: the oldest 70% of the known-age live protocols fit, the newest 30% are held
+  // out. The training era is the protocols listed at or before the cutoff, so the training priors
+  // never see a held-out label.
+  const byAge = [...knownLive].sort((a, b) => ageDays(snapshot.as_of, b.listed_at)! - ageDays(snapshot.as_of, a.listed_at)!);
+  const cut = Math.floor(byAge.length * 0.7);
+  const trainLive = byAge.slice(0, cut);
+  const testLive = byAge.slice(cut);
+  const cutoffAge = ageDays(snapshot.as_of, byAge[cut - 1]!.listed_at)!;
+  const trainEra = snapshot.protocols.filter((p) => {
+    const a = ageDays(snapshot.as_of, p.listed_at);
+    return a !== null && a >= cutoffAge;
+  });
+  const testEra = snapshot.protocols.filter((p) => {
+    const a = ageDays(snapshot.as_of, p.listed_at);
+    return a !== null && a < cutoffAge;
+  });
+  const calTrain = calibrate(snapshot, model, trainEra);
+  const bvTrain = ols(trainLive.map((p) => valueFeatures(p, snapshot.as_of, calTrain, model)), trainLive.map((p) => Math.log(p.mcap_usd!)));
+  const blTrain = logistic(trainEra.map((p) => launchFeatures(p, snapshot.as_of, calTrain, model)), trainEra.map((p) => (isLive(p) ? 1 : 0)));
+  const time = splitMetrics(bvTrain, blTrain, testLive, testEra, snapshot, calTrain, model, cutoffAge);
+  time.train_n = trainLive.length;
+
+  // The random split: the same known-age live set shuffled by the fixed seed, 70/30.
+  const order = knownLive.map((_, i) => i);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    const t = order[i]!;
+    order[i] = order[j]!;
+    order[j] = t;
+  }
+  const rTrainLive = order.slice(0, Math.floor(order.length * 0.7)).map((i) => knownLive[i]!);
+  const rTestLive = order.slice(Math.floor(order.length * 0.7)).map((i) => knownLive[i]!);
+  const knownAll = snapshot.protocols.filter((p) => ageDays(snapshot.as_of, p.listed_at) !== null);
+  const rOrder = knownAll.map((_, i) => i);
+  for (let i = rOrder.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    const t = rOrder[i]!;
+    rOrder[i] = rOrder[j]!;
+    rOrder[j] = t;
+  }
+  const rTrainAll = rOrder.slice(0, Math.floor(rOrder.length * 0.7)).map((i) => knownAll[i]!);
+  const rTestAll = rOrder.slice(Math.floor(rOrder.length * 0.7)).map((i) => knownAll[i]!);
+  const calRandom = calibrate(snapshot, model, rTrainAll);
+  const bvRandom = ols(rTrainLive.map((p) => valueFeatures(p, snapshot.as_of, calRandom, model)), rTrainLive.map((p) => Math.log(p.mcap_usd!)));
+  const blRandom = logistic(rTrainAll.map((p) => launchFeatures(p, snapshot.as_of, calRandom, model)), rTrainAll.map((p) => (isLive(p) ? 1 : 0)));
+  const random = splitMetrics(bvRandom, blRandom, rTestLive, rTestAll, snapshot, calRandom, model, cutoffAge);
+  random.train_n = rTrainLive.length;
+
+  // The bootstrap: B resamples of the regression rows, priors held fixed, both halves refit.
+  const b = 200;
+  const valueNames = ['intercept', 'log_tvl', 'value_prior', 'age', 'growth', 'chain', 'missing_age'];
+  const launchNames = ['intercept', 'age', 'growth', 'chain', 'launch_prior', 'missing_age'];
+  const valueBoots: number[][] = [];
+  const launchBoots: number[][] = [];
+  const Xv = live.map((p) => valueFeatures(p, snapshot.as_of, cal, model));
+  const yv = live.map((p) => Math.log(p.mcap_usd!));
+  const Xl = snapshot.protocols.map((p) => launchFeatures(p, snapshot.as_of, cal, model));
+  const yl = snapshot.protocols.map((p) => (isLive(p) ? 1 : 0));
+  for (let k = 0; k < b; k++) {
+    const idxV = Array.from({ length: live.length }, () => Math.floor(rnd() * live.length));
+    try {
+      valueBoots.push(ols(idxV.map((i) => Xv[i]!), idxV.map((i) => yv[i]!)));
+    } catch {
+      // A resample with no variation in one feature is singular; it carries no information.
+    }
+    const idxL = Array.from({ length: snapshot.protocols.length }, () => Math.floor(rnd() * snapshot.protocols.length));
+    try {
+      launchBoots.push(logistic(idxL.map((i) => Xl[i]!), idxL.map((i) => yl[i]!)));
+    } catch {
+      // Same: a singular resample is skipped, not patched.
+    }
+  }
+  const ranges = (names: string[], boots: number[][], fitted: number[]): CoefficientRange[] =>
+    names.map((name, j) => {
+      const col = boots.map((row) => row[j]!).sort((x, y) => x - y);
+      return {
+        name,
+        fitted: round4(fitted[j]!),
+        low: round4(col[0]!),
+        high: round4(col[col.length - 1]!),
+        median: round4(col[Math.floor(col.length / 2)]!),
+      };
+    });
+  return {
+    live_fit_n: live.length,
+    known_age_live_n: knownLive.length,
+    missing_age_live_n: missingAgeLive,
+    insample_value_rmse_log: round4(insampleRmse),
+    insample_value_median_abs_log_error: round4(insampleMed),
+    time_split: time,
+    random_split: random,
+    bootstrap_b: b,
+    bootstrap_seed: seed,
+    value_bootstrap: ranges(valueNames, valueBoots, [
+      shipped.value.intercept, shipped.value.log_tvl, shipped.value.value_prior, shipped.value.age,
+      shipped.value.growth, shipped.value.chain, shipped.value.missing_age,
+    ]),
+    launch_bootstrap: ranges(launchNames, launchBoots, [
+      shipped.launch.intercept, shipped.launch.age, shipped.launch.growth, shipped.launch.chain,
+      shipped.launch.launch_prior, shipped.launch.missing_age,
+    ]),
+  };
+}
+
 /** The numeric core of one protocol's score, before the drivers and risks are written. */
 interface ScoreCore {
   implied: number;
@@ -376,14 +824,18 @@ interface ScoreCore {
 }
 
 /**
- * One protocol's score under `model`: a launch probability times a conditional value. The
- * multipliers let the confidence band recompute the same function with TVL and growth moved;
- * the base call passes none.
+ * One protocol's score under the fitted model: a launch probability times a conditional value.
+ * The multipliers let the confidence band recompute the same function with TVL and growth moved;
+ * the base call passes none. The fitted value half is exp of the value regression's prediction;
+ * the launch half is the sigmoid of the launch regression's logit, less the delay penalty for a
+ * protocol listed more than three years ago with no token, and less the fixed missing-growth
+ * penalty when seven-day growth is unreported.
  */
 export function scoreCore(
   p: SnapshotProtocol,
   asOf: string,
   cal: Calibration,
+  fitted: FittedModel,
   model: ModelConstants,
   tvlMult = 1,
   growthMult = 1,
@@ -393,48 +845,38 @@ export function scoreCore(
   const missingGrowth = p.change_7d === null;
   const tvl = p.tvl_usd * tvlMult;
   const rawGrowth = p.change_7d === null ? null : p.change_7d * growthMult;
-  const ageScore = age === null ? 0 : 1 - Math.exp(-age / 365);
-  const growthScore = rawGrowth === null
-    ? 0
-    : Math.tanh(Math.min(model.growth_clamp_pct, Math.max(-model.growth_clamp_pct, rawGrowth)) / model.growth_scale);
-  const chainScore = 1 - Math.exp(-Math.log1p(p.chains.length) / Math.log(9));
-  const tvlScore = percentile(cal.tvl_sorted, tvl);
+  const ageS = ageScore(age);
+  const growthS = growthScore(rawGrowth, model);
+  const chainS = chainScore(p.chains.length);
+  const tvlS = percentile(cal.tvl_sorted, tvl);
   const delay = age !== null && age > model.delay_threshold_days
     ? Math.min(model.delay_cap, model.delay_scale * Math.log(age / model.delay_threshold_days))
     : 0;
-  const prior = cal.categories[p.category ?? 'Other'] ?? {
-    live: 0,
-    total: 0,
-    launch_prior: cal.global_launch_rate,
-    value_prior: cal.global_value_log_median,
-    value_samples: 0,
-  };
-  const logit = model.intercept
-    + model.age_weight * ageScore
-    + model.growth_weight * growthScore
-    + model.chain_weight * chainScore
-    + model.launch_prior_weight * prior.launch_prior
-    - (missingAge ? model.missing_age_penalty : 0)
+  const prior = priorOf(cal, p.category);
+  const vFeatures = valueFeatures(p, asOf, cal, model, tvlMult, growthMult);
+  const vBeta = [
+    fitted.value.intercept, fitted.value.log_tvl, fitted.value.value_prior, fitted.value.age,
+    fitted.value.growth, fitted.value.chain, fitted.value.missing_age,
+  ];
+  const logV = vFeatures.reduce((s, v, j) => s + v * vBeta[j]!, 0) - (missingGrowth ? model.missing_growth_penalty : 0);
+  const vConditional = Math.exp(Math.max(-30, Math.min(30, logV)));
+  const lFeatures = launchFeatures(p, asOf, cal, model);
+  const lBeta = [
+    fitted.launch.intercept, fitted.launch.age, fitted.launch.growth, fitted.launch.chain,
+    fitted.launch.launch_prior, fitted.launch.missing_age,
+  ];
+  const logit = lFeatures.reduce((s, v, j) => s + v * lBeta[j]!, 0)
     - (missingGrowth ? model.missing_growth_penalty : 0)
     - delay;
-  const pLaunch = 1 / (1 + Math.exp(-logit));
-  const vConditional = tvl * Math.exp(
-    prior.value_prior + model.value_offset
-      + model.value_tvl_weight * tvlScore
-      + model.value_growth_weight * growthScore
-      + model.value_age_weight * ageScore
-      + model.value_chain_weight * chainScore
-      - (missingAge ? model.missing_age_penalty : 0)
-      - (missingGrowth ? model.missing_growth_penalty : 0),
-  );
+  const pLaunch = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, logit))));
   return {
     implied: Math.max(1, Math.round(pLaunch * vConditional)),
     pLaunch,
     vConditional,
-    ageScore,
-    growthScore,
-    chainScore,
-    tvlScore,
+    ageScore: ageS,
+    growthScore: growthS,
+    chainScore: chainS,
+    tvlScore: tvlS,
     launchPrior: prior.launch_prior,
     valuePrior: prior.value_prior,
     missingAge,
@@ -447,7 +889,7 @@ export function scoreCore(
 /** The three largest signed contributions to a row's score, in plain words. */
 function driversFor(p: SnapshotProtocol, core: ScoreCore, cal: Calibration): string[] {
   const cat = p.category ?? 'Other';
-  const prior = cal.categories[cat] ?? { live: 0, total: 0, launch_prior: cal.global_launch_rate, value_prior: cal.global_value_log_median, value_samples: 0 };
+  const prior = priorOf(cal, p.category);
   const candidates: Array<{ weight: number; order: number; text: string }> = [
     {
       weight: core.tvlScore,
@@ -487,7 +929,7 @@ function driversFor(p: SnapshotProtocol, core: ScoreCore, cal: Calibration): str
 /** What is missing, extreme, concentrated or weakly calibrated about a row, at most three. */
 function risksFor(p: SnapshotProtocol, core: ScoreCore, cal: Calibration): string[] {
   const cat = p.category ?? 'Other';
-  const prior = cal.categories[cat] ?? { live: 0, total: 0, launch_prior: cal.global_launch_rate, value_prior: cal.global_value_log_median, value_samples: 0 };
+  const prior = priorOf(cal, p.category);
   const risks: string[] = [];
   if (core.missingAge) risks.push('Age unknown — the model gives no maturity credit and applies a penalty.');
   if (core.missingGrowth) risks.push('Seven-day growth is not reported — treated as neutral, with a penalty.');
@@ -559,7 +1001,7 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
 }
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
-export function buildBoard(snapshot: Snapshot, cal: Calibration, model: ModelConstants = MODEL): BoardRow[] {
+export function buildBoard(snapshot: Snapshot, cal: Calibration, fitted: FittedModel, model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but
@@ -577,14 +1019,14 @@ export function buildBoard(snapshot: Snapshot, cal: Calibration, model: ModelCon
   cal.tvl_sorted = [...chosen.values()].map((p) => p.tvl_usd).sort((a, b) => a - b);
 
   const scored = [...chosen.values()].map((p) => {
-    const core = scoreCore(p, snapshot.as_of, cal, model);
-    const low = scoreCore(p, snapshot.as_of, cal, model, model.band_tvl_down, model.band_growth_down);
-    const high = scoreCore(p, snapshot.as_of, cal, model, model.band_tvl_up, model.band_growth_up);
+    const core = scoreCore(p, snapshot.as_of, cal, fitted, model);
+    const low = scoreCore(p, snapshot.as_of, cal, fitted, model, model.band_tvl_down, model.band_growth_down);
+    const high = scoreCore(p, snapshot.as_of, cal, fitted, model, model.band_tvl_up, model.band_growth_up);
     return { p, core, low: low.implied, high: high.implied };
   });
   scored.sort((a, b) => b.core.implied - a.core.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => {
-    const { steps, plan } = farmPlan(s.p, s.core.age);
+    const { steps, plan } = farmPlan(s.p, s.core.age, s.core.pLaunch, s.core.vConditional);
     return {
       rank: i + 1,
       slug: s.p.slug,
@@ -738,17 +1180,39 @@ function riskFlagsFor(p: SnapshotProtocol, age: number | null): string[] {
   return flags.slice(0, 4);
 }
 
-/** A protocol's farm plan: the steps plus its money, its hold and its way out. */
-export function farmPlan(p: SnapshotProtocol, age: number | null): { steps: FarmStep[]; plan: FarmPlan } {
+/**
+ * A protocol's farm plan: the steps plus its money, its hold and its way out, all netted to the
+ * dollar. The net cost is every dollar committed — capital, setup gas and the weekly gas over the
+ * hold — and the capital comes back on exit, so only the setup and weekly gas are actually spent.
+ * The expected gross is the model's launch probability times the model's conditional value times
+ * the farmer's share of TVL (capital / TVL): it assumes any future token is distributed pro-rata
+ * to TVL share, because the snapshot carries no airdrop terms at all, and it is a scenario, not a
+ * promise — the research note states the assumption in full. The expected net is that gross less
+ * the sunk cost. At the position sizes this board uses, the expected net is usually negative: a
+ * $50–$250 position in a $50M+ protocol is a dust share of any future token.
+ */
+export function farmPlan(p: SnapshotProtocol, age: number | null, pLaunch: number, vConditional: number): { steps: FarmStep[]; plan: FarmPlan } {
   const capital = capitalFor(p);
   const hold = holdDaysFor(age);
+  const setup = setupCostFor(capital);
+  const weeks = Math.max(1, Math.ceil(hold / 7));
+  const weekly = 2;
+  const sunk = setup + weekly * weeks;
+  const netCost = capital + sunk;
+  const share = p.tvl_usd > 0 ? capital / p.tvl_usd : 0;
+  const gross = pLaunch * vConditional * share;
   return {
     steps: farmSteps(p, age),
     plan: {
       capital_usd: capital,
-      setup_cost_usd: setupCostFor(capital),
-      weekly_cost_usd: 2,
+      setup_cost_usd: setup,
+      weekly_cost_usd: weekly,
       hold_days: hold,
+      weeks,
+      net_cost_usd: round2(netCost),
+      sunk_cost_usd: round2(sunk),
+      expected_gross_usd: round2(gross),
+      expected_net_usd: round2(gross - sunk),
       exit_steps: [
         'Withdraw through the app’s own route once the minimum holding period is complete.',
         'Stop and exit early if TVL falls 25%, deposits pause, or the weekly cost exceeds the expected reward.',
@@ -803,7 +1267,9 @@ export function radarRow(row: BoardRow): RadarRow {
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const cal = calibrate(snapshot, model);
-  const board = buildBoard(snapshot, cal, model);
+  const fitted = fitModel(snapshot, cal, model);
+  const validation = validateModel(snapshot, cal, model);
+  const board = buildBoard(snapshot, cal, fitted, model);
   const live = liveRows(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const covered = snapshot.watchlist.filter((s) => board.some((r) => r.slug === s)).length;
@@ -815,6 +1281,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     floor_usd: snapshot.floor_usd,
     model,
     model_version: MODEL_VERSION,
+    fitted,
+    validation,
     watchlist_size: snapshot.watchlist.length,
     watchlist_covered: covered,
     watchlist: [...snapshot.watchlist].sort(),
