@@ -82,12 +82,45 @@ if (!existsSync(research)) {
 }
 copyFileSync(research, join(out, 'dashboard', 'RESEARCH.md'));
 // The validation numbers as a dashboard file, so the dossier's text carries them: the key
-// metrics first, so even a cut dossier keeps them.
+// metrics first, so even a cut dossier keeps them. The fitted coefficients in here are the
+// reference fits; the five fold launch models' per-category priors live in data.js, which is what
+// the dashboard reads — they would cost the dossier text two kilobytes of numbers for no new
+// information, since the fold models themselves are here. The bootstrap ranges are likewise left
+// out of this file (they are in data.js, where the dashboard's coefficient tables read them, and
+// their headline ranges are stated in the research note); this file carries the splits, the
+// out-of-fold numbers and the expanding window, which are what the dossier's reader needs.
+const { value_bootstrap: _vb, launch_bootstrap: _lb, bootstrap_b: _bb, bootstrap_seed: _bs, ...validationWithoutBootstrap } = radar.validation;
+// The full-fit launch coefficients are stated in the research note (§2) and the fold fits below
+// are the ones the board uses; the per-fold expanding-window numbers are likewise in the note
+// (§4), as are the fitted value coefficients. The fold launch priors are the bulkiest part of the
+// fitted model and live in data.js, which is what the dashboard reads. The fitted numbers here
+// are rounded to four decimals: the dashboard recomputes from data.js at full precision, and this
+// file is the reference copy. The ridge grid is documented in the note (§3) and left out of both
+// copies. `validation` comes before `fitted` so that, if the dossier text ever runs short, the
+// splits survive and the fold fits — whose numbers the note already states — are what gets cut.
+const { launch: _fl, launch_fold_priors: _lfp, ...fittedWithoutFullLaunch } = radar.fitted;
+const { folds: _ef, ...expandingWithoutFolds } = validationWithoutBootstrap.expanding_window;
+const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+const roundRecord = (f: Record<string, number>): Record<string, number> =>
+  Object.fromEntries(Object.entries(f).map(([k, v]) => [k, round4(v)]));
+const { grid: _grid, ...ridgeWithoutGrid } = radar.fitted.ridge;
 const validationDoc = {
   model_version: radar.model_version,
   as_of: radar.as_of,
-  fitted: radar.fitted,
-  validation: radar.validation,
+  headline: {
+    time_value_spearman: radar.validation.time_split.value_spearman,
+    random_value_spearman: radar.validation.random_split.value_spearman,
+    expanding_value_spearman: radar.validation.expanding_window.mean_spearman,
+    oof_value_spearman: radar.validation.oof.value_spearman,
+    oof_launch_auc: radar.validation.oof.launch_auc,
+    time_launch_auc: radar.validation.time_split.launch_auc,
+    value_lambda: radar.validation.ridge.value_lambda,
+    launch_lambda: radar.validation.ridge.launch_lambda,
+  },
+  validation: { ...validationWithoutBootstrap, expanding_window: expandingWithoutFolds, ridge: ridgeWithoutGrid },
+  fitted: {
+    launch_folds: fittedWithoutFullLaunch.launch_folds.map(roundRecord),
+  },
 };
 writeFileSync(join(out, 'dashboard', 'validation.json'), `${JSON.stringify(validationDoc, null, 2)}\n`);
 const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
