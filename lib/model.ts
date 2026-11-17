@@ -1,4 +1,4 @@
-// Token Radar's model, radar-4: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model, radar-5: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds
 // every other pre-token protocol the house's own rule would keep: a protocol is rankable when it
@@ -16,17 +16,24 @@
 // there.
 //
 // Implied value is a launch probability times a conditional value, and the same function scores
-// every row; no protocol name is ever special-cased. radar-4 fits both halves by regression on
-// the snapshot's own 129 live-token protocols, at runtime, from the sealed input — no coefficient
-// is hand-set any more except the two the data cannot identify (see below):
+// every row; no protocol name is ever special-cased. radar-5 fits both halves by ridge regression
+// on the snapshot's own 129 live-token protocols, at runtime, from the sealed input — the ridge
+// strength is chosen by five-fold cross-validation on the live set, not hand-set, and no
+// coefficient is hand-set any more except the two the data cannot identify (see below):
 //
-//   value:  log(market cap) is fit by ordinary least squares on the live protocols, on
-//           [1, log(TVL), category value prior, age score, growth score, chain score,
-//            missing-age flag]. V_conditional is exp(that prediction).
-//   launch: launched-or-not is fit by logistic regression (iteratively reweighted least squares)
-//           on all 758 protocols, on [1, age score, growth score, chain score, category launch
-//           prior, missing-age flag]. P_launch is the sigmoid of that logit, less a delay penalty
-//           for protocols listed more than three years ago with no token.
+//   value:  log(market cap) is fit by ridge least squares on the live protocols, on
+//           [1, log(TVL), category value prior, growth score, chain score,
+//            missing-age flag]. Age was dropped from this half in radar-5: on the time-split
+//           holdout its coefficient blew up to 7.51 on the old-only training window and the
+//           ranking collapsed (Spearman 0.04); without it the time-split Spearman is 0.24 and
+//           the median log error halves. V_conditional is exp(that prediction).
+//   launch: launched-or-not is fit by ridge logistic regression (iteratively reweighted least
+//           squares) on all 758 protocols, on [1, age score, growth score, chain score,
+//           category launch prior, missing-age flag]. P_launch is the sigmoid of that logit,
+//           less a delay penalty for protocols listed more than three years ago with no token.
+//           The board's P_launch is cross-fitted: each row is scored by one of five fold models
+//           trained without that row (fold by a hash of the slug, five-fold), each fold with its
+//           own category launch priors, so no row's own label enters its own probability.
 //   implied = max(1, round(P_launch x V_conditional))
 //
 // The two numbers the data cannot identify stay fixed constants, and the research note says why:
@@ -38,15 +45,17 @@
 //
 // The fit is validated at runtime, on the same snapshot, and the numbers are on the dashboard and
 // in validation.json: a TIME split (the oldest 70% of the live protocols with a recorded listing
-// date fit the model, the newest 30% are held out), a RANDOM 70/30 split of the same set, and a
-// bootstrap (B = 200, fixed seed) that refits both regressions on resampled data and reports each
-// coefficient's range. 34 live protocols have no listing date and cannot be placed in time, so
-// the holdout covers the 95 with one; the note says so. The band around a row recomputes the same
-// function with TVL at 70% and 130% and seven-day growth at 80% and 120%: it is a sensitivity
-// range, not a second model. Drivers are the three largest signed contributions to the score;
-// risks name what is missing, extreme, concentrated or weakly calibrated. The dashboard states
-// the formula, carries the fitted coefficients and the validation, and recomputes every row from
-// the same figures, so the page and board.json agree to the dollar.
+// date fit the model, the newest 30% are held out), a RANDOM 70/30 split of the same set, an
+// EXPANDING-WINDOW test (five eras by listing date, each era predicted by a model fit only on
+// older eras), five-fold OUT-OF-FOLD predictions for both halves, and a bootstrap (B = 200, fixed
+// seed) that refits both regressions on resampled data and reports each coefficient's range. 34
+// live protocols have no listing date and cannot be placed in time, so the holdout covers the 95
+// with one; the note says so. The band around a row recomputes the same function with TVL at 70%
+// and 130% and seven-day growth at 80% and 120%: it is a sensitivity range, not a second model.
+// Drivers are the three largest signed contributions to the score; risks name what is missing,
+// extreme, concentrated or weakly calibrated. The dashboard states the formula, carries the fitted
+// coefficients and the validation, and recomputes every row from the same figures, so the page and
+// board.json agree to the dollar.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -101,14 +110,14 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-4';
+export const MODEL_VERSION = 'radar-5';
 
-/** The fitted value regression: log(market cap) on the features, in this order. */
+/** The fitted value regression: log(market cap) on the features, in this order. Age is not one of
+ * them any more: radar-5 dropped it from this half (see the header). */
 export interface FittedValue {
   intercept: number;
   log_tvl: number;
   value_prior: number;
-  age: number;
   growth: number;
   chain: number;
   missing_age: number;
@@ -124,10 +133,45 @@ export interface FittedLaunch {
   missing_age: number;
 }
 
-/** Both fitted halves, as the dashboard recomputes a row from them. */
+/** Both fitted halves, as the dashboard recomputes a row from them. `launch` is the full fit, a
+ * reference; the board's P_launch comes from `launch_folds`, one fold model per row, each with its
+ * own launch priors, so no row's own label enters its own probability. */
 export interface FittedModel {
   value: FittedValue;
   launch: FittedLaunch;
+  launch_folds: FittedLaunch[];
+  launch_fold_priors: Array<{ global_launch_rate: number; categories: Record<string, number> }>;
+  ridge: RidgeChoice;
+}
+
+/** A ridge strength, chosen by five-fold cross-validation, and the metric that chose it. */
+export interface RidgeChoice {
+  value_lambda: number;
+  value_cv_spearman: number;
+  launch_lambda: number;
+  launch_cv_auc: number;
+  grid: number[];
+  folds: number;
+}
+
+/** Five-fold out-of-fold metrics: every row predicted by a model trained without it. */
+export interface OofMetrics {
+  value_spearman: number;
+  value_median_abs_log_error: number;
+  value_top10_hit: number;
+  value_top10_n: number;
+  launch_auc: number;
+  launch_n: number;
+  launch_live_n: number;
+}
+
+/** One era of the expanding-window test: a younger era predicted by a model fit only on older eras. */
+export interface ExpandingFold {
+  train_n: number;
+  test_n: number;
+  cutoff_age_days: number;
+  value_spearman: number;
+  value_median_abs_log_error: number;
 }
 
 /** One fitted coefficient with its bootstrap range. */
@@ -153,7 +197,8 @@ export interface SplitMetrics {
   launch_test_live_n: number;
 }
 
-/** The runtime validation: both splits, the in-sample fit, and the bootstrap ranges. */
+/** The runtime validation: both splits, the expanding window, the out-of-fold predictions, the
+ * in-sample fit, and the bootstrap ranges. */
 export interface Validation {
   live_fit_n: number;
   known_age_live_n: number;
@@ -162,6 +207,13 @@ export interface Validation {
   insample_value_median_abs_log_error: number;
   time_split: SplitMetrics;
   random_split: SplitMetrics;
+  ridge: RidgeChoice;
+  oof: OofMetrics;
+  expanding_window: {
+    mean_spearman: number;
+    mean_median_abs_log_error: number;
+    folds: ExpandingFold[];
+  };
   bootstrap_b: number;
   bootstrap_seed: number;
   value_bootstrap: CoefficientRange[];
@@ -218,10 +270,12 @@ export interface FarmPlan {
   risk_flags: string[];
 }
 
-/** One row's model detail: the score, its band, its drivers and its risks. */
+/** One row's model detail: the score, its band, its drivers and its risks. `fold` is the
+ * cross-fit fold that scored this row's launch probability (0..4). */
 export interface RowModel {
   p_launch: number;
   v_conditional: number;
+  fold: number;
   age_score: number;
   growth_score: number;
   chain_score: number;
@@ -454,7 +508,10 @@ function chainScore(chains: number): number {
   return 1 - Math.exp(-Math.log1p(chains) / Math.log(9));
 }
 
-/** The value regression's feature row: [1, log TVL, value prior, age, growth, chain, missing age]. */
+/** The value regression's feature row: [1, log TVL, value prior, growth, chain, missing age].
+ * Age is deliberately not here any more: on the time-split holdout it is the extrapolation poison
+ * (radar-4's age coefficient blew up to 7.51 on the old-only window and scrambled the young test
+ * rows); the launch half keeps age, where it is identified across the full age range. */
 function valueFeatures(p: SnapshotProtocol, asOf: string, cal: Calibration, model: ModelConstants, tvlMult = 1, growthMult = 1): number[] {
   const age = ageDays(asOf, p.listed_at);
   const prior = priorOf(cal, p.category);
@@ -462,7 +519,6 @@ function valueFeatures(p: SnapshotProtocol, asOf: string, cal: Calibration, mode
     1,
     Math.log(Math.max(p.tvl_usd * tvlMult, 1)),
     prior.value_prior,
-    ageScore(age),
     growthScore(p.change_7d === null ? null : p.change_7d * growthMult, model),
     chainScore(p.chains.length),
     age === null ? 1 : 0,
@@ -523,49 +579,180 @@ function solve(A: number[][], b: number[]): number[] {
   return x;
 }
 
-/** Ordinary least squares by the normal equations, with a hair of ridge for stability. */
-function ols(X: number[][], y: number[]): number[] {
+/**
+ * The ridge machinery: every fit standardizes its non-intercept columns (mean 0, sd 1, a constant
+ * column's sd guarded to 1 so it standardizes to all zeros), adds `lambda` to the standardized
+ * non-intercept diagonal, and converts the coefficients back to the raw feature scale. The
+ * intercept is never penalized. Standardizing first is what makes one lambda meaningful across
+ * features on wildly different scales (log TVL near 20, a prior near 0.1). The conversion back
+ * divides by sds[j - 1]: means/sds are indexed by the sliced column, j - 1 for raw feature j.
+ */
+function standardize(X: number[][]): { Xs: number[][]; means: number[]; sds: number[] } {
   const k = X[0]!.length;
+  const means: number[] = [];
+  const sds: number[] = [];
+  for (let j = 1; j < k; j++) {
+    const col = X.map((r) => r[j]!);
+    const m = col.reduce((s, v) => s + v, 0) / col.length;
+    const sd = Math.sqrt(col.reduce((s, v) => s + (v - m) ** 2, 0) / col.length) || 1;
+    means.push(m);
+    sds.push(sd);
+  }
+  const Xs = X.map((r) => [1, ...r.slice(1).map((v, j) => (v - means[j]!) / sds[j]!)]);
+  return { Xs, means, sds };
+}
+
+function unstandardize(betaStd: number[], means: number[], sds: number[]): number[] {
+  const k = betaStd.length;
+  const beta = new Array<number>(k).fill(0);
+  beta[0] = betaStd[0]! - betaStd.slice(1).reduce((s, v, j) => s + v * means[j]! / sds[j]!, 0);
+  for (let j = 1; j < k; j++) beta[j] = betaStd[j]! / sds[j - 1]!;
+  return beta;
+}
+
+/** Ridge least squares by the normal equations, on standardized features. */
+function ridgeOls(X: number[][], y: number[], lambda: number): number[] {
+  const { Xs, means, sds } = standardize(X);
+  const k = Xs[0]!.length;
   const A: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
   const b = new Array<number>(k).fill(0);
-  for (let i = 0; i < X.length; i++) {
+  for (let i = 0; i < Xs.length; i++) {
     for (let a = 0; a < k; a++) {
-      b[a]! += X[i]![a]! * y[i]!;
-      for (let c = 0; c < k; c++) A[a]![c]! += X[i]![a]! * X[i]![c]!;
+      b[a]! += Xs[i]![a]! * y[i]!;
+      for (let c = 0; c < k; c++) A[a]![c]! += Xs[i]![a]! * Xs[i]![c]!;
     }
   }
-  for (let a = 0; a < k; a++) A[a]![a]! += 1e-9;
-  return solve(A, b);
+  for (let a = 1; a < k; a++) A[a]![a]! += lambda;
+  A[0]![0]! += 1e-9;
+  return unstandardize(solve(A, b), means, sds);
 }
 
 /**
- * Logistic regression by iteratively reweighted least squares: the logit is fit, the weights are
- * the fitted probabilities' variance, and the loop stops when no coefficient moves by more than
- * 1e-9, or after 25 rounds. A hair of ridge keeps a near-separated feature solvable.
+ * Ridge logistic regression by iteratively reweighted least squares: the logit is fit, the weights
+ * are the fitted probabilities' variance, and the loop stops when no coefficient moves by more
+ * than 1e-9, or after 25 rounds. The ridge is applied on standardized features, like the value
+ * half, so one lambda means the same thing in both halves.
  */
-function logistic(X: number[][], y: number[]): number[] {
-  const k = X[0]!.length;
+function ridgeLogistic(X: number[][], y: number[], lambda: number): number[] {
+  const { Xs, means, sds } = standardize(X);
+  const k = Xs[0]!.length;
   let beta = new Array<number>(k).fill(0);
   for (let it = 0; it < 25; it++) {
     const A: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
     const b = new Array<number>(k).fill(0);
-    for (let i = 0; i < X.length; i++) {
-      const z = Math.max(-30, Math.min(30, X[i]!.reduce((s, v, j) => s + v * beta[j]!, 0)));
+    for (let i = 0; i < Xs.length; i++) {
+      const z = Math.max(-30, Math.min(30, Xs[i]!.reduce((s, v, j) => s + v * beta[j]!, 0)));
       const p = 1 / (1 + Math.exp(-z));
       const w = Math.max(p * (1 - p), 1e-6);
       for (let a = 0; a < k; a++) {
-        b[a]! += X[i]![a]! * ((y[i]! - p) + w * z);
-        for (let c = 0; c < k; c++) A[a]![c]! += w * X[i]![a]! * X[i]![c]!;
+        b[a]! += Xs[i]![a]! * ((y[i]! - p) + w * z);
+        for (let c = 0; c < k; c++) A[a]![c]! += w * Xs[i]![a]! * Xs[i]![c]!;
       }
     }
-    for (let a = 0; a < k; a++) A[a]![a]! += 1e-8;
+    for (let a = 1; a < k; a++) A[a]![a]! += lambda;
+    A[0]![0]! += 1e-8;
     const next = solve(A, b);
     let moved = 0;
     for (let j = 0; j < k; j++) moved = Math.max(moved, Math.abs(next[j]! - beta[j]!));
     beta = next;
     if (moved < 1e-9) break;
   }
-  return beta;
+  return unstandardize(beta, means, sds);
+}
+
+/** A protocol's cross-fit fold, 0..4, from an FNV-1a hash of its slug: deterministic, no seed. */
+export function foldOfSlug(slug: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < slug.length; i++) {
+    h ^= slug.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0) % 5;
+}
+
+/** The ridge grid the cross-validation searches. */
+const LAMBDA_GRID = [0.03, 0.1, 0.3, 1, 3, 10, 30];
+
+/**
+ * The cross-validation tolerance: the smallest lambda within this much of the best score wins.
+ * The profiles are flat to a few thousandths across the whole grid — far inside the sampling
+ * noise of a rank correlation on 128 rows — so the argmax would be a coin flip, and on this
+ * snapshot it lands on the grid's edge (lambda 30, ahead by 0.003). The smallest lambda inside
+ * the band is the stable choice: the least shrinkage that the data cannot distinguish from the best.
+ */
+const LAMBDA_TOLERANCE = 0.01;
+
+/** The smallest lambda whose cross-validated score is within the tolerance of the best. */
+function pickLambda(scores: Array<{ lambda: number; score: number }>): { lambda: number; cv: number } {
+  const best = Math.max(...scores.map((s) => s.score));
+  const chosen = scores.find((s) => s.score >= best - LAMBDA_TOLERANCE)!;
+  return { lambda: chosen.lambda, cv: round4(chosen.score) };
+}
+
+/**
+ * The ridge strength for the value half, by five-fold cross-validation on the live set: for each
+ * lambda, every fold is predicted by a model fit on the other four, and the pooled Spearman is
+ * the score. The category priors are recalibrated per fold from the training protocols only: a
+ * held-out row's own market cap enters its category's value prior in the full calibration (a
+ * small category's median is that row), and a cross-validation that lets it in scores the leak,
+ * not the model — the full-prior version reads 0.56, the honest per-fold version 0.29.
+ */
+function chooseValueLambda(snapshot: Snapshot, model: ModelConstants): { lambda: number; cv: number } {
+  const live = fitLive(snapshot);
+  const y = live.map((p) => Math.log(p.mcap_usd!));
+  const scores: Array<{ lambda: number; score: number }> = [];
+  for (const lambda of LAMBDA_GRID) {
+    const pred = new Array<number>(live.length).fill(0);
+    for (let f = 0; f < 5; f++) {
+      const trainPool = snapshot.protocols.filter((p) => foldOfSlug(p.slug) !== f);
+      const calFold = calibrate(snapshot, model, trainPool);
+      const tr = live.map((_, i) => i).filter((i) => foldOfSlug(live[i]!.slug) !== f);
+      const te = live.map((_, i) => i).filter((i) => foldOfSlug(live[i]!.slug) === f);
+      if (te.length === 0) continue;
+      const beta = ridgeOls(
+        tr.map((i) => valueFeatures(live[i]!, snapshot.as_of, calFold, model)),
+        tr.map((i) => y[i]!),
+        lambda,
+      );
+      for (const i of te) {
+        pred[i] = valueFeatures(live[i]!, snapshot.as_of, calFold, model).reduce((s, v, j) => s + v * beta[j]!, 0);
+      }
+    }
+    scores.push({ lambda, score: spearman(pred, y) });
+  }
+  return pickLambda(scores);
+}
+
+/**
+ * The ridge strength for the launch half, by the same five-fold cross-validation, scored by AUC,
+ * with the priors recalibrated per fold for the same reason: a held-out row's own label enters its
+ * category's launch prior in the full calibration, and a single-live category's prior is mostly
+ * that row.
+ */
+function chooseLaunchLambda(snapshot: Snapshot, model: ModelConstants): { lambda: number; cv: number } {
+  const y = snapshot.protocols.map((p) => (isLive(p) ? 1 : 0));
+  const scores: Array<{ lambda: number; score: number }> = [];
+  for (const lambda of LAMBDA_GRID) {
+    const pred = new Array<number>(y.length).fill(0);
+    for (let f = 0; f < 5; f++) {
+      const trainPool = snapshot.protocols.filter((p) => foldOfSlug(p.slug) !== f);
+      const calFold = calibrate(snapshot, model, trainPool);
+      const tr = snapshot.protocols.map((_, i) => i).filter((i) => foldOfSlug(snapshot.protocols[i]!.slug) !== f);
+      const te = snapshot.protocols.map((_, i) => i).filter((i) => foldOfSlug(snapshot.protocols[i]!.slug) === f);
+      if (te.length === 0) continue;
+      const beta = ridgeLogistic(
+        tr.map((i) => launchFeatures(snapshot.protocols[i]!, snapshot.as_of, calFold, model)),
+        tr.map((i) => y[i]!),
+        lambda,
+      );
+      for (const i of te) {
+        const z = Math.max(-30, Math.min(30, launchFeatures(snapshot.protocols[i]!, snapshot.as_of, calFold, model).reduce((s, v, j) => s + v * beta[j]!, 0)));
+        pred[i] = 1 / (1 + Math.exp(-z));
+      }
+    }
+    scores.push({ lambda, score: auc(pred, y) });
+  }
+  return pickLambda(scores);
 }
 
 /** Spearman's rank correlation, ties averaged: how well a prediction orders the actual values. */
@@ -610,20 +797,61 @@ function auc(scores: number[], labels: number[]): number {
   return wins / (pos.length * neg.length);
 }
 
-/** The fitted halves, from the snapshot's own live protocols and the whole protocol set. */
+/**
+ * The fitted halves, from the snapshot's own live protocols and the whole protocol set. The ridge
+ * strengths come from five-fold cross-validation on the same rows (value: pooled Spearman, launch:
+ * pooled AUC), with the category priors recalibrated per fold, and the smallest lambda within 0.01
+ * of the best score wins, so no lambda is hand-set and a flat profile cannot pick a grid edge.
+ * The board's launch probabilities are cross-fitted: five
+ * fold models, each trained on the four fifths that exclude its fold, each with its own category
+ * launch priors recalibrated from its training protocols only, so no row's own label enters its
+ * own probability. The value half needs no cross-fit for the board: it is fit on live-token
+ * protocols only, and every board row is pre-token, so a board row was never a fit row.
+ */
 export function fitModel(snapshot: Snapshot, cal: Calibration, model: ModelConstants = MODEL): FittedModel {
   const live = fitLive(snapshot);
-  const bv = ols(live.map((p) => valueFeatures(p, snapshot.as_of, cal, model)), live.map((p) => Math.log(p.mcap_usd!)));
-  const bl = logistic(snapshot.protocols.map((p) => launchFeatures(p, snapshot.as_of, cal, model)), snapshot.protocols.map((p) => (isLive(p) ? 1 : 0)));
+  const valueChoice = chooseValueLambda(snapshot, model);
+  const bv = ridgeOls(
+    live.map((p) => valueFeatures(p, snapshot.as_of, cal, model)),
+    live.map((p) => Math.log(p.mcap_usd!)),
+    valueChoice.lambda,
+  );
+  const launchChoice = chooseLaunchLambda(snapshot, model);
+  const bl = ridgeLogistic(
+    snapshot.protocols.map((p) => launchFeatures(p, snapshot.as_of, cal, model)),
+    snapshot.protocols.map((p) => (isLive(p) ? 1 : 0)),
+    launchChoice.lambda,
+  );
+  const launchFolds: FittedLaunch[] = [];
+  const launchFoldPriors: Array<{ global_launch_rate: number; categories: Record<string, number> }> = [];
+  for (let f = 0; f < 5; f++) {
+    const train = snapshot.protocols.filter((p) => foldOfSlug(p.slug) !== f);
+    const calFold = calibrate(snapshot, model, train);
+    const bf = ridgeLogistic(
+      train.map((p) => launchFeatures(p, snapshot.as_of, calFold, model)),
+      train.map((p) => (isLive(p) ? 1 : 0)),
+      launchChoice.lambda,
+    );
+    launchFolds.push({
+      intercept: bf[0]!,
+      age: bf[1]!,
+      growth: bf[2]!,
+      chain: bf[3]!,
+      launch_prior: bf[4]!,
+      missing_age: bf[5]!,
+    });
+    const priors: Record<string, number> = {};
+    for (const [key, prior] of Object.entries(calFold.categories)) priors[key] = prior.launch_prior;
+    launchFoldPriors.push({ global_launch_rate: calFold.global_launch_rate, categories: priors });
+  }
   return {
     value: {
       intercept: bv[0]!,
       log_tvl: bv[1]!,
       value_prior: bv[2]!,
-      age: bv[3]!,
-      growth: bv[4]!,
-      chain: bv[5]!,
-      missing_age: bv[6]!,
+      growth: bv[3]!,
+      chain: bv[4]!,
+      missing_age: bv[5]!,
     },
     launch: {
       intercept: bl[0]!,
@@ -632,6 +860,16 @@ export function fitModel(snapshot: Snapshot, cal: Calibration, model: ModelConst
       chain: bl[3]!,
       launch_prior: bl[4]!,
       missing_age: bl[5]!,
+    },
+    launch_folds: launchFolds,
+    launch_fold_priors: launchFoldPriors,
+    ridge: {
+      value_lambda: valueChoice.lambda,
+      value_cv_spearman: valueChoice.cv,
+      launch_lambda: launchChoice.lambda,
+      launch_cv_auc: launchChoice.cv,
+      grid: [...LAMBDA_GRID],
+      folds: 5,
     },
   };
 }
@@ -676,12 +914,16 @@ function splitMetrics(
 }
 
 /**
- * The runtime validation: a time split, a random split and a bootstrap, all from the sealed
- * snapshot. The splits cover only the live protocols with a recorded listing date — 34 live
- * protocols have none and cannot be placed in time, so they are counted here, not hidden. The
- * random split uses the same fixed seed as the bootstrap, and the bootstrap refits both
- * regressions on resampled data with the priors held fixed, so its ranges measure the
- * regressions' own sampling wobble, not the priors'.
+ * The runtime validation: a time split, a random split, an expanding-window test, five-fold
+ * out-of-fold predictions for both halves, and a bootstrap, all from the sealed snapshot. The
+ * splits cover only the live protocols with a recorded listing date — 34 live protocols have
+ * none and cannot be placed in time, so they are counted here, not hidden. The random split uses
+ * the same fixed seed as the bootstrap, and the bootstrap refits both regressions on resampled
+ * data with the priors held fixed, so its ranges measure the regressions' own sampling wobble,
+ * not the priors'. The split fits use the ridge strengths the cross-validation chose on the full
+ * set (a single hyperparameter from a flat profile; the note says so), and the out-of-fold
+ * predictions recalibrate the category priors per fold, so a held-out row never enters its own
+ * prior either.
  */
 export function validateModel(snapshot: Snapshot, cal: Calibration, model: ModelConstants = MODEL): Validation {
   const live = fitLive(snapshot);
@@ -692,11 +934,12 @@ export function validateModel(snapshot: Snapshot, cal: Calibration, model: Model
 
   // In-sample fit quality, on the same rows the shipped coefficients are fit from.
   const shipped = fitModel(snapshot, cal, model);
+  const shippedValueBeta = [
+    shipped.value.intercept, shipped.value.log_tvl, shipped.value.value_prior,
+    shipped.value.growth, shipped.value.chain, shipped.value.missing_age,
+  ];
   const inResid = live.map((p) => {
-    const pred = valueFeatures(p, snapshot.as_of, cal, model).reduce((s, v, j) => s + v * [
-      shipped.value.intercept, shipped.value.log_tvl, shipped.value.value_prior, shipped.value.age,
-      shipped.value.growth, shipped.value.chain, shipped.value.missing_age,
-    ][j]!, 0);
+    const pred = valueFeatures(p, snapshot.as_of, cal, model).reduce((s, v, j) => s + v * shippedValueBeta[j]!, 0);
     return Math.log(p.mcap_usd!) - pred;
   });
   const insampleRmse = Math.sqrt(inResid.reduce((s, r) => s + r * r, 0) / inResid.length);
@@ -719,8 +962,8 @@ export function validateModel(snapshot: Snapshot, cal: Calibration, model: Model
     return a !== null && a < cutoffAge;
   });
   const calTrain = calibrate(snapshot, model, trainEra);
-  const bvTrain = ols(trainLive.map((p) => valueFeatures(p, snapshot.as_of, calTrain, model)), trainLive.map((p) => Math.log(p.mcap_usd!)));
-  const blTrain = logistic(trainEra.map((p) => launchFeatures(p, snapshot.as_of, calTrain, model)), trainEra.map((p) => (isLive(p) ? 1 : 0)));
+  const bvTrain = ridgeOls(trainLive.map((p) => valueFeatures(p, snapshot.as_of, calTrain, model)), trainLive.map((p) => Math.log(p.mcap_usd!)), shipped.ridge.value_lambda);
+  const blTrain = ridgeLogistic(trainEra.map((p) => launchFeatures(p, snapshot.as_of, calTrain, model)), trainEra.map((p) => (isLive(p) ? 1 : 0)), shipped.ridge.launch_lambda);
   const time = splitMetrics(bvTrain, blTrain, testLive, testEra, snapshot, calTrain, model, cutoffAge);
   time.train_n = trainLive.length;
 
@@ -745,14 +988,103 @@ export function validateModel(snapshot: Snapshot, cal: Calibration, model: Model
   const rTrainAll = rOrder.slice(0, Math.floor(rOrder.length * 0.7)).map((i) => knownAll[i]!);
   const rTestAll = rOrder.slice(Math.floor(rOrder.length * 0.7)).map((i) => knownAll[i]!);
   const calRandom = calibrate(snapshot, model, rTrainAll);
-  const bvRandom = ols(rTrainLive.map((p) => valueFeatures(p, snapshot.as_of, calRandom, model)), rTrainLive.map((p) => Math.log(p.mcap_usd!)));
-  const blRandom = logistic(rTrainAll.map((p) => launchFeatures(p, snapshot.as_of, calRandom, model)), rTrainAll.map((p) => (isLive(p) ? 1 : 0)));
+  const bvRandom = ridgeOls(rTrainLive.map((p) => valueFeatures(p, snapshot.as_of, calRandom, model)), rTrainLive.map((p) => Math.log(p.mcap_usd!)), shipped.ridge.value_lambda);
+  const blRandom = ridgeLogistic(rTrainAll.map((p) => launchFeatures(p, snapshot.as_of, calRandom, model)), rTrainAll.map((p) => (isLive(p) ? 1 : 0)), shipped.ridge.launch_lambda);
   const random = splitMetrics(bvRandom, blRandom, rTestLive, rTestAll, snapshot, calRandom, model, cutoffAge);
   random.train_n = rTrainLive.length;
 
-  // The bootstrap: B resamples of the regression rows, priors held fixed, both halves refit.
+  // The out-of-fold predictions: every row predicted by a model trained without it, with the
+  // category priors recalibrated per fold, so a held-out row never enters its own prior either.
+  // The value half is out-of-fold on the 128 live rows; the launch half on all 758 protocols.
+  // The board's value rows are pre-token and were never fit rows, so the board's V_conditional is
+  // already out-of-sample; the board's P_launch is the same fold machinery, one fold per row.
+  const oofValuePred = new Array<number>(live.length).fill(0);
+  const oofLaunchPred = new Array<number>(snapshot.protocols.length).fill(0);
+  for (let f = 0; f < 5; f++) {
+    const trainPool = snapshot.protocols.filter((p) => foldOfSlug(p.slug) !== f);
+    const calFold = calibrate(snapshot, model, trainPool);
+    const trainLiveFold = live.filter((p) => foldOfSlug(p.slug) !== f);
+    const bvFold = ridgeOls(
+      trainLiveFold.map((p) => valueFeatures(p, snapshot.as_of, calFold, model)),
+      trainLiveFold.map((p) => Math.log(p.mcap_usd!)),
+      shipped.ridge.value_lambda,
+    );
+    live.forEach((p, i) => {
+      if (foldOfSlug(p.slug) !== f) return;
+      oofValuePred[i] = valueFeatures(p, snapshot.as_of, calFold, model).reduce((s, v, j) => s + v * bvFold[j]!, 0);
+    });
+    const blFold = ridgeLogistic(
+      trainPool.map((p) => launchFeatures(p, snapshot.as_of, calFold, model)),
+      trainPool.map((p) => (isLive(p) ? 1 : 0)),
+      shipped.ridge.launch_lambda,
+    );
+    snapshot.protocols.forEach((p, i) => {
+      if (foldOfSlug(p.slug) !== f) return;
+      const z = Math.max(-30, Math.min(30, launchFeatures(p, snapshot.as_of, calFold, model).reduce((s, v, j) => s + v * blFold[j]!, 0)));
+      oofLaunchPred[i] = 1 / (1 + Math.exp(-z));
+    });
+  }
+  const oofActual = live.map((p) => Math.log(p.mcap_usd!));
+  const oofTopActual = new Set(
+    oofActual.map((v, i) => [v, i] as const).sort((a, b) => b[0] - a[0]).slice(0, 10).map(([, i]) => i),
+  );
+  const oofTopPred = new Set(
+    oofValuePred.map((v, i) => [v, i] as const).sort((a, b) => b[0] - a[0]).slice(0, 10).map(([, i]) => i),
+  );
+  let oofHit = 0;
+  for (const i of oofTopActual) if (oofTopPred.has(i)) oofHit++;
+  const oof: OofMetrics = {
+    value_spearman: round4(spearman(oofValuePred, oofActual)),
+    value_median_abs_log_error: round4(median(oofActual.map((y, i) => Math.abs(y - oofValuePred[i]!)))),
+    value_top10_hit: oofHit,
+    value_top10_n: 10,
+    launch_auc: round4(auc(oofLaunchPred, snapshot.protocols.map((p) => (isLive(p) ? 1 : 0)))),
+    launch_n: snapshot.protocols.length,
+    launch_live_n: snapshot.protocols.filter(isLive).length,
+  };
+
+  // The expanding window: five eras by listing date, oldest first; each era is predicted by a
+  // model fit only on older eras, with priors recalibrated from the older protocols only. This is
+  // the "predict the future" test repeated four times, not once: the single time split is its
+  // most extreme case (train on the oldest 70%, test on the newest 30%).
+  const byAgeDesc = [...knownLive].sort((a, b) => ageDays(snapshot.as_of, b.listed_at)! - ageDays(snapshot.as_of, a.listed_at)!);
+  const eraSize = Math.floor(byAgeDesc.length / 5);
+  const expandingFolds: ExpandingFold[] = [];
+  for (let f = 1; f < 5; f++) {
+    const trainRows = byAgeDesc.slice(0, f * eraSize);
+    const testRows = byAgeDesc.slice(f * eraSize, (f + 1) * eraSize);
+    if (testRows.length === 0) continue;
+    const cutoff = ageDays(snapshot.as_of, trainRows[trainRows.length - 1]!.listed_at)!;
+    const trainPool = snapshot.protocols.filter((p) => {
+      const a = ageDays(snapshot.as_of, p.listed_at);
+      return a !== null && a >= cutoff;
+    });
+    const calEra = calibrate(snapshot, model, trainPool);
+    const bvEra = ridgeOls(
+      trainRows.map((p) => valueFeatures(p, snapshot.as_of, calEra, model)),
+      trainRows.map((p) => Math.log(p.mcap_usd!)),
+      shipped.ridge.value_lambda,
+    );
+    const predEra = testRows.map((p) => valueFeatures(p, snapshot.as_of, calEra, model).reduce((s, v, j) => s + v * bvEra[j]!, 0));
+    const actualEra = testRows.map((p) => Math.log(p.mcap_usd!));
+    expandingFolds.push({
+      train_n: trainRows.length,
+      test_n: testRows.length,
+      cutoff_age_days: cutoff,
+      value_spearman: round4(spearman(predEra, actualEra)),
+      value_median_abs_log_error: round4(median(actualEra.map((y, i) => Math.abs(y - predEra[i]!)))),
+    });
+  }
+  const expanding = {
+    mean_spearman: round4(expandingFolds.reduce((s, x) => s + x.value_spearman, 0) / expandingFolds.length),
+    mean_median_abs_log_error: round4(expandingFolds.reduce((s, x) => s + x.value_median_abs_log_error, 0) / expandingFolds.length),
+    folds: expandingFolds,
+  };
+
+  // The bootstrap: B resamples of the regression rows, priors held fixed, both halves refit at the
+  // shipped ridge strengths.
   const b = 200;
-  const valueNames = ['intercept', 'log_tvl', 'value_prior', 'age', 'growth', 'chain', 'missing_age'];
+  const valueNames = ['intercept', 'log_tvl', 'value_prior', 'growth', 'chain', 'missing_age'];
   const launchNames = ['intercept', 'age', 'growth', 'chain', 'launch_prior', 'missing_age'];
   const valueBoots: number[][] = [];
   const launchBoots: number[][] = [];
@@ -763,13 +1095,13 @@ export function validateModel(snapshot: Snapshot, cal: Calibration, model: Model
   for (let k = 0; k < b; k++) {
     const idxV = Array.from({ length: live.length }, () => Math.floor(rnd() * live.length));
     try {
-      valueBoots.push(ols(idxV.map((i) => Xv[i]!), idxV.map((i) => yv[i]!)));
+      valueBoots.push(ridgeOls(idxV.map((i) => Xv[i]!), idxV.map((i) => yv[i]!), shipped.ridge.value_lambda));
     } catch {
       // A resample with no variation in one feature is singular; it carries no information.
     }
     const idxL = Array.from({ length: snapshot.protocols.length }, () => Math.floor(rnd() * snapshot.protocols.length));
     try {
-      launchBoots.push(logistic(idxL.map((i) => Xl[i]!), idxL.map((i) => yl[i]!)));
+      launchBoots.push(ridgeLogistic(idxL.map((i) => Xl[i]!), idxL.map((i) => yl[i]!), shipped.ridge.launch_lambda));
     } catch {
       // Same: a singular resample is skipped, not patched.
     }
@@ -793,12 +1125,12 @@ export function validateModel(snapshot: Snapshot, cal: Calibration, model: Model
     insample_value_median_abs_log_error: round4(insampleMed),
     time_split: time,
     random_split: random,
+    ridge: shipped.ridge,
+    oof,
+    expanding_window: expanding,
     bootstrap_b: b,
     bootstrap_seed: seed,
-    value_bootstrap: ranges(valueNames, valueBoots, [
-      shipped.value.intercept, shipped.value.log_tvl, shipped.value.value_prior, shipped.value.age,
-      shipped.value.growth, shipped.value.chain, shipped.value.missing_age,
-    ]),
+    value_bootstrap: ranges(valueNames, valueBoots, shippedValueBeta),
     launch_bootstrap: ranges(launchNames, launchBoots, [
       shipped.launch.intercept, shipped.launch.age, shipped.launch.growth, shipped.launch.chain,
       shipped.launch.launch_prior, shipped.launch.missing_age,
@@ -806,11 +1138,13 @@ export function validateModel(snapshot: Snapshot, cal: Calibration, model: Model
   };
 }
 
-/** The numeric core of one protocol's score, before the drivers and risks are written. */
+/** The numeric core of one protocol's score, before the drivers and risks are written. `fold` is
+ * the cross-fit fold that scored this row's launch probability. */
 interface ScoreCore {
   implied: number;
   pLaunch: number;
   vConditional: number;
+  fold: number;
   ageScore: number;
   growthScore: number;
   chainScore: number;
@@ -826,10 +1160,11 @@ interface ScoreCore {
 /**
  * One protocol's score under the fitted model: a launch probability times a conditional value.
  * The multipliers let the confidence band recompute the same function with TVL and growth moved;
- * the base call passes none. The fitted value half is exp of the value regression's prediction;
- * the launch half is the sigmoid of the launch regression's logit, less the delay penalty for a
- * protocol listed more than three years ago with no token, and less the fixed missing-growth
- * penalty when seven-day growth is unreported.
+ * the base call passes none. The fitted value half is exp of the value regression's prediction
+ * (age is not a value feature any more); the launch half is the sigmoid of the logit from the
+ * fold model trained without this row, with that fold's own category launch prior, less the delay
+ * penalty for a protocol listed more than three years ago with no token, and less the fixed
+ * missing-growth penalty when seven-day growth is unreported.
  */
 export function scoreCore(
   p: SnapshotProtocol,
@@ -855,17 +1190,21 @@ export function scoreCore(
   const prior = priorOf(cal, p.category);
   const vFeatures = valueFeatures(p, asOf, cal, model, tvlMult, growthMult);
   const vBeta = [
-    fitted.value.intercept, fitted.value.log_tvl, fitted.value.value_prior, fitted.value.age,
+    fitted.value.intercept, fitted.value.log_tvl, fitted.value.value_prior,
     fitted.value.growth, fitted.value.chain, fitted.value.missing_age,
   ];
   const logV = vFeatures.reduce((s, v, j) => s + v * vBeta[j]!, 0) - (missingGrowth ? model.missing_growth_penalty : 0);
   const vConditional = Math.exp(Math.max(-30, Math.min(30, logV)));
-  const lFeatures = launchFeatures(p, asOf, cal, model);
-  const lBeta = [
-    fitted.launch.intercept, fitted.launch.age, fitted.launch.growth, fitted.launch.chain,
-    fitted.launch.launch_prior, fitted.launch.missing_age,
-  ];
-  const logit = lFeatures.reduce((s, v, j) => s + v * lBeta[j]!, 0)
+  const fold = foldOfSlug(p.slug);
+  const foldLaunch = fitted.launch_folds[fold]!;
+  const foldPrior = fitted.launch_fold_priors[fold]!;
+  const launchPrior = foldPrior.categories[p.category ?? 'Other'] ?? foldPrior.global_launch_rate;
+  const logit = foldLaunch.intercept
+    + foldLaunch.age * ageS
+    + foldLaunch.growth * growthS
+    + foldLaunch.chain * chainS
+    + foldLaunch.launch_prior * launchPrior
+    + foldLaunch.missing_age * (missingAge ? 1 : 0)
     - (missingGrowth ? model.missing_growth_penalty : 0)
     - delay;
   const pLaunch = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, logit))));
@@ -873,11 +1212,12 @@ export function scoreCore(
     implied: Math.max(1, Math.round(pLaunch * vConditional)),
     pLaunch,
     vConditional,
+    fold,
     ageScore: ageS,
     growthScore: growthS,
     chainScore: chainS,
     tvlScore: tvlS,
-    launchPrior: prior.launch_prior,
+    launchPrior,
     valuePrior: prior.value_prior,
     missingAge,
     missingGrowth,
@@ -949,6 +1289,7 @@ function rowModel(p: SnapshotProtocol, core: ScoreCore, low: number, high: numbe
   return {
     p_launch: round4(core.pLaunch),
     v_conditional: Math.round(core.vConditional),
+    fold: core.fold,
     age_score: round4(core.ageScore),
     growth_score: round4(core.growthScore),
     chain_score: round4(core.chainScore),
