@@ -1,6 +1,6 @@
 // Token Radar's entry program (Node 22, standard library only).
 //
-// It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits the radar-4
+// It reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits the radar-6
 // model on the snapshot's own live-token protocols in lib/model.ts, writes the ranked board to
 // /output/board.json, writes the dashboard's data beside the page as data.js, copies this
 // repository's dashboard/ and screenshots/ to /output, copies RESEARCH.md into the dashboard so
