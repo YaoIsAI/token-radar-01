@@ -1,16 +1,8 @@
 // Token Radar's night-scope dashboard. It reads window.RADAR (written beside dashboard/ by
 // main.ts) and renders the ranked board, a filterable table, a top-3 spotlight, a per-protocol
-// detail drawer with the model's own inputs, its confidence band, its drivers and risks and the
-// protocol's farm plan, and a live-token view for every protocol whose token already trades. No
-// network: every byte it shows is in data.js.
-//
-// Views by URL, so a screenshot can be taken of each state:
-//   ?view=board                        the full board
-//   ?view=detail&slug=<slug>           one protocol's detail drawer, open on load
-//   ?view=filtered&category=<name>     the board filtered to one category
-//   ?view=filtered&q=<text>            the board filtered by search text
-//   ?view=board&tab=live               the live-token view
-// A hash (#p=<slug>, #q=<text>, #category=<name>) does the same, so a shared link keeps its state.
+// detail drawer and a live-token view. No network: every byte it shows is in data.js. Views by
+// URL (?view=board|detail|filtered|validation, &slug=, &category=, &q=, &tab=live) or hash
+// (#p=<slug>, #q=<text>, #category=<name>), so a screenshot can be taken of each state.
 (function () {
   'use strict';
 
@@ -44,12 +36,11 @@
     return Math.max(0, Math.round(days)) + 'd';
   }
 
-// The radar-4 model in one function: the page recomputes a row from the snapshot figures, the
+// The radar-5 model in one function: the page recomputes a row from the snapshot figures, the
   // fitted coefficients data.js carries and the fixed constants, and checks the number board.json
-  // carries, so the page's code and the board's data are visibly the same arithmetic. This mirrors
-  // lib/model.ts scoreCore exactly: same features, same order, same rounding. The check allows a
-  // one-dollar difference: Math.log can differ by a last bit between engines, which can flip a
-  // rounded dollar on a value this size, and a dollar is not a disagreement.
+  // carries. This mirrors lib/model.ts scoreCore exactly: same features, same order, same rounding
+  // (a one-dollar difference is allowed: Math.log can differ by a last bit between engines). A
+  // row's launch probability comes from its own cross-fit fold (row.model.fold).
   function impliedOf(row) {
     var fitted = DATA.fitted;
     var cal = DATA.calibration;
@@ -64,7 +55,6 @@
     var logV = fitted.value.intercept
       + fitted.value.log_tvl * Math.log(Math.max(row.tvl_usd, 1))
       + fitted.value.value_prior * prior.value_prior
-      + fitted.value.age * ageScore
       + fitted.value.growth * growthScore
       + fitted.value.chain * chainScore
       + fitted.value.missing_age * (missingAge ? 1 : 0)
@@ -73,12 +63,18 @@
     var delay = (age !== null && age > model.delay_threshold_days)
       ? Math.min(model.delay_cap, model.delay_scale * Math.log(age / model.delay_threshold_days))
       : 0;
-    var logit = fitted.launch.intercept
-      + fitted.launch.age * ageScore
-      + fitted.launch.growth * growthScore
-      + fitted.launch.chain * chainScore
-      + fitted.launch.launch_prior * prior.launch_prior
-      + fitted.launch.missing_age * (missingAge ? 1 : 0)
+    var fold = (row.model && typeof row.model.fold === 'number') ? row.model.fold : 0;
+    var launchFold = fitted.launch_folds[fold];
+    var foldPrior = fitted.launch_fold_priors[fold];
+    var launchPrior = (foldPrior.categories[row.category || 'Other'] !== undefined)
+      ? foldPrior.categories[row.category || 'Other']
+      : foldPrior.global_launch_rate;
+    var logit = launchFold.intercept
+      + launchFold.age * ageScore
+      + launchFold.growth * growthScore
+      + launchFold.chain * chainScore
+      + launchFold.launch_prior * launchPrior
+      + launchFold.missing_age * (missingAge ? 1 : 0)
       - (missingGrowth ? model.missing_growth_penalty : 0)
       - delay;
     var pLaunch = 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, logit))));
@@ -397,10 +393,11 @@
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures. Both halves are fit by regression on this snapshot’s own ' + v.live_fit_n + ' live-token protocols, at runtime — no coefficient is hand-set except the two the data cannot identify (see the research note). No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
         'implied = round(P_launch x V_conditional)' +
-        '\nlog V_conditional = ' + f.value.intercept.toFixed(2) + ' + ' + f.value.log_tvl.toFixed(2) + ' x log(TVL) + ' + f.value.value_prior.toFixed(2) + ' x category value prior + ' + f.value.age.toFixed(2) + ' x age + ' + f.value.growth.toFixed(2) + ' x growth + ' + f.value.chain.toFixed(2) + ' x chains + ' + f.value.missing_age.toFixed(2) + ' if age unknown − 0.05 if growth unreported' +
+        '\nlog V_conditional = ' + f.value.intercept.toFixed(2) + ' + ' + f.value.log_tvl.toFixed(2) + ' x log(TVL) + ' + f.value.value_prior.toFixed(2) + ' x category value prior + ' + f.value.growth.toFixed(2) + ' x growth + ' + f.value.chain.toFixed(2) + ' x chains + ' + f.value.missing_age.toFixed(2) + ' if age unknown − 0.05 if growth unreported' +
         '\nP_launch = sigmoid(' + f.launch.intercept.toFixed(2) + ' + ' + f.launch.age.toFixed(2) + ' x age + ' + f.launch.growth.toFixed(2) + ' x growth + ' + f.launch.chain.toFixed(2) + ' x chains + ' + f.launch.launch_prior.toFixed(2) + ' x category launch prior + ' + f.launch.missing_age.toFixed(2) + ' if age unknown − 0.05 if growth unreported − delay past 3y)'
       ),
-      el('p', { class: 'sub', text: 'Category priors are shrunk toward the global rates (' + (cal.global_launch_rate * 100).toFixed(1) + '% launch rate, median log(market cap / TVL) ' + cal.global_value_log_median.toFixed(2) + '). Time-split holdout: Spearman ' + v.time_split.value_spearman.toFixed(2) + ', top-10 hit ' + v.time_split.value_top10_hit + '/' + v.time_split.value_top10_n + ', median log error ' + v.time_split.value_median_abs_log_error.toFixed(2) + ', launch AUC ' + v.time_split.launch_auc.toFixed(2) + '. Full backtest below, and the research note for the method, the assumptions and the limits.' })
+      el('p', { class: 'sub', text: 'Both halves are ridge regressions fit at runtime (value ridge ' + v.ridge.value_lambda + ', launch ridge ' + v.ridge.launch_lambda + ', each chosen by five-fold cross-validation). Age is not a value feature any more: it broke the time-split ranking in the last version. A row’s P_launch comes from the fold model trained without that row (5-fold cross-fit, fold priors of its own); the launch line above is the full fit, for reference, and the five fold fits are in validation.json.' }),
+      el('p', { class: 'sub', text: 'Category priors are shrunk toward the global rates (' + (cal.global_launch_rate * 100).toFixed(1) + '% launch rate, median log(market cap / TVL) ' + cal.global_value_log_median.toFixed(2) + '). Time-split holdout: Spearman ' + v.time_split.value_spearman.toFixed(2) + ', top-10 hit ' + v.time_split.value_top10_hit + '/' + v.time_split.value_top10_n + ', median log error ' + v.time_split.value_median_abs_log_error.toFixed(2) + ', launch AUC ' + v.time_split.launch_auc.toFixed(2) + '. Expanding-window mean Spearman ' + v.expanding_window.mean_spearman.toFixed(2) + '; out-of-fold value Spearman ' + v.oof.value_spearman.toFixed(2) + ', launch AUC ' + v.oof.launch_auc.toFixed(2) + '. Full backtest below, and the research note for the method, the assumptions and the limits.' })
     );
   }
 
@@ -444,6 +441,10 @@
     }
     var rows = splitRows(t, 'Time split (oldest 70% fit, newest 30% held out)').concat(splitRows(r, 'Random split (70/30, fixed seed)'));
     rows.unshift(['In-sample value fit (' + v.live_fit_n + ' live protocols)', 'RMSE (log) ' + v.insample_value_rmse_log.toFixed(2) + ', median |log error| ' + v.insample_value_median_abs_log_error.toFixed(2)]);
+    rows.unshift(['Ridge, chosen by 5-fold cross-validation (grid 0.03–30, smallest λ within 0.01 of the best wins)', 'value λ ' + v.ridge.value_lambda + ' (CV Spearman ' + v.ridge.value_cv_spearman.toFixed(2) + '), launch λ ' + v.ridge.launch_lambda + ' (CV AUC ' + v.ridge.launch_cv_auc.toFixed(2) + ')']);
+    rows.push(['Expanding window — mean over 4 eras (each era predicted by a model fit only on older eras)', 'value Spearman ' + v.expanding_window.mean_spearman.toFixed(2) + ' (folds ' + v.expanding_window.folds.map(function (f) { return f.value_spearman.toFixed(2); }).join(', ') + '), mean median |log error| ' + v.expanding_window.mean_median_abs_log_error.toFixed(2)]);
+    rows.push(['Out-of-fold value (' + v.live_fit_n + ' live protocols, 5 folds, priors recalibrated per fold)', 'Spearman ' + v.oof.value_spearman.toFixed(2) + ', median |log error| ' + v.oof.value_median_abs_log_error.toFixed(2) + ', top-10 hit ' + v.oof.value_top10_hit + ' / ' + v.oof.value_top10_n]);
+    rows.push(['Out-of-fold launch (' + v.oof.launch_n + ' protocols, ' + v.oof.launch_live_n + ' live, 5 folds, priors recalibrated per fold)', 'AUC ' + v.oof.launch_auc.toFixed(2)]);
     rows.push(['Holdout coverage', v.known_age_live_n + ' live protocols with a recorded listing date; ' + v.missing_age_live_n + ' live protocols have none and cannot be placed in time, so they are counted here, not hidden.']);
     var tbody = el('tbody');
     rows.forEach(function (row) {
@@ -451,14 +452,14 @@
     });
     var panel = el('section', { class: 'panel model' },
       el('h2', { text: 'Backtest — does the fitted model predict what it has not seen?' }),
-      el('p', { class: 'sub', text: 'The model is fit on this snapshot’s live-token protocols, then tested on held-out ones it never saw. The time split is the hard test: it fits the oldest 70% and predicts the newest 30%, so it must extrapolate to younger protocols. The random split is the easier test: same distribution, new rows. Read the time split first.' }),
+      el('p', { class: 'sub', text: 'The model is fit on this snapshot’s live-token protocols, then tested on held-out ones it never saw. The time split is the hard test: it fits the oldest 70% and predicts the newest 30%, so it must extrapolate to younger protocols. The random split is the easier test: same distribution, new rows. The expanding window repeats the time test four times, era by era. The out-of-fold rows predict every row from a model trained without it. Read the time split first.' }),
       el('div', { class: 'table-wrap' },
         el('table', { class: 'checks' },
           el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Check' }), el('th', { scope: 'col', text: 'Result' }))),
           tbody
         )
       ),
-      el('p', { class: 'sub', text: 'What the numbers say: the value model orders held-out market caps moderately (Spearman ' + t.value_spearman.toFixed(2) + ' on the time split, ' + r.value_spearman.toFixed(2) + ' on the random split) and its dollar error is wide — a median log error of ' + t.value_median_abs_log_error.toFixed(2) + ' is a factor of about x' + Math.exp(t.value_median_abs_log_error).toFixed(1) + ' on the time split. Treat implied values as an ordering, not a price. The bootstrap ranges below show which coefficients the data actually pins down: log(TVL) and the category value prior are stable; age, growth and chain are not.' })
+      el('p', { class: 'sub', text: 'What the numbers say: the value model orders held-out market caps moderately (Spearman ' + t.value_spearman.toFixed(2) + ' on the time split, ' + r.value_spearman.toFixed(2) + ' on the random split, ' + v.oof.value_spearman.toFixed(2) + ' out-of-fold) and its dollar error is wide — a median log error of ' + t.value_median_abs_log_error.toFixed(2) + ' is a factor of about x' + Math.exp(t.value_median_abs_log_error).toFixed(1) + ' on the time split. The youngest era is still unrankable: the expanding window’s last fold, the newest 19 protocols, scores near zero for every variant tried. Treat implied values as an ordering, not a price. The bootstrap ranges below show which coefficients the data actually pins down: log(TVL) and the category value prior are stable; growth and chain are not.' })
     );
     var wrap = el('div', null, panel, coefTable('Value coefficients — log(market cap)', v.value_bootstrap), coefTable('Launch coefficients — logit of launched-or-not', v.launch_bootstrap));
     return wrap;
