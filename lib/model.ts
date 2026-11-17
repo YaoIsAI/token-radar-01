@@ -1,4 +1,4 @@
-// Token Radar's model, radar-5: one snapshot of the protocol universe in, one ranked board out.
+// Token Radar's model, radar-6: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds
 // every other pre-token protocol the house's own rule would keep: a protocol is rankable when it
@@ -16,17 +16,21 @@
 // there.
 //
 // Implied value is a launch probability times a conditional value, and the same function scores
-// every row; no protocol name is ever special-cased. radar-5 fits both halves by ridge regression
+// every row; no protocol name is ever special-cased. radar-6 fits both halves by ridge regression
 // on the snapshot's own 129 live-token protocols, at runtime, from the sealed input — the ridge
 // strength is chosen by five-fold cross-validation on the live set, not hand-set, and no
 // coefficient is hand-set any more except the two the data cannot identify (see below):
 //
 //   value:  log(market cap) is fit by ridge least squares on the live protocols, on
-//           [1, log(TVL), category value prior, growth score, chain score,
-//            missing-age flag]. Age was dropped from this half in radar-5: on the time-split
-//           holdout its coefficient blew up to 7.51 on the old-only training window and the
-//           ranking collapsed (Spearman 0.04); without it the time-split Spearman is 0.24 and
-//           the median log error halves. V_conditional is exp(that prediction).
+//           [1, log(TVL), category value prior] only. radar-6 dropped the other three
+//           features: the bootstrap (B = 200) says only log(TVL) and the category value
+//           prior are consistently positive, and the ablation shows growth, chains and the
+//           missing-age flag are noise — dropping them improves every holdout at once
+//           (time-split Spearman 0.24 → 0.25, random 0.41 → 0.42, expanding window
+//           0.29 → 0.29, out-of-fold 0.29 → 0.33; median log error down on all four).
+//           V_conditional is exp(that prediction). Age was already out of this half
+//           since radar-5, for the same reason (its coefficient blew up to 7.51 on the
+//           old-only training window and the ranking collapsed).
 //   launch: launched-or-not is fit by ridge logistic regression (iteratively reweighted least
 //           squares) on all 758 protocols, on [1, age score, growth score, chain score,
 //           category launch prior, missing-age flag]. P_launch is the sigmoid of that logit,
@@ -110,17 +114,16 @@ export const MODEL: ModelConstants = {
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-5';
+export const MODEL_VERSION = 'radar-6';
 
-/** The fitted value regression: log(market cap) on the features, in this order. Age is not one of
- * them any more: radar-5 dropped it from this half (see the header). */
+/** The fitted value regression: log(market cap) on the features, in this order. radar-6 keeps
+ * only the two the bootstrap pins down — log(TVL) and the category value prior. Growth, chains
+ * and the missing-age flag were dropped: their bootstrap ranges cross zero, and the ablation
+ * shows they cost ranking quality on every holdout (see the research note). */
 export interface FittedValue {
   intercept: number;
   log_tvl: number;
   value_prior: number;
-  growth: number;
-  chain: number;
-  missing_age: number;
 }
 
 /** The fitted launch regression: the logit of launched-or-not, in this order. */
@@ -508,20 +511,19 @@ function chainScore(chains: number): number {
   return 1 - Math.exp(-Math.log1p(chains) / Math.log(9));
 }
 
-/** The value regression's feature row: [1, log TVL, value prior, growth, chain, missing age].
- * Age is deliberately not here any more: on the time-split holdout it is the extrapolation poison
- * (radar-4's age coefficient blew up to 7.51 on the old-only window and scrambled the young test
- * rows); the launch half keeps age, where it is identified across the full age range. */
-function valueFeatures(p: SnapshotProtocol, asOf: string, cal: Calibration, model: ModelConstants, tvlMult = 1, growthMult = 1): number[] {
-  const age = ageDays(asOf, p.listed_at);
+/** The value regression's feature row: [1, log TVL, value prior]. Growth, chains and the
+ * missing-age flag are deliberately not here any more: the bootstrap says only log(TVL) and the
+ * value prior are stable, and the ablation shows the other three cost ranking quality on every
+ * holdout. Age is not here either, for the same reason as in radar-5 (its coefficient blew up
+ * to 7.51 on the old-only time-split window); the launch half keeps age, where it is identified
+ * across the full age range. `tvlMult` lets the confidence band recompute the same function
+ * with TVL moved. */
+function valueFeatures(p: SnapshotProtocol, asOf: string, cal: Calibration, model: ModelConstants, tvlMult = 1): number[] {
   const prior = priorOf(cal, p.category);
   return [
     1,
     Math.log(Math.max(p.tvl_usd * tvlMult, 1)),
     prior.value_prior,
-    growthScore(p.change_7d === null ? null : p.change_7d * growthMult, model),
-    chainScore(p.chains.length),
-    age === null ? 1 : 0,
   ];
 }
 
@@ -849,9 +851,6 @@ export function fitModel(snapshot: Snapshot, cal: Calibration, model: ModelConst
       intercept: bv[0]!,
       log_tvl: bv[1]!,
       value_prior: bv[2]!,
-      growth: bv[3]!,
-      chain: bv[4]!,
-      missing_age: bv[5]!,
     },
     launch: {
       intercept: bl[0]!,
@@ -936,7 +935,6 @@ export function validateModel(snapshot: Snapshot, cal: Calibration, model: Model
   const shipped = fitModel(snapshot, cal, model);
   const shippedValueBeta = [
     shipped.value.intercept, shipped.value.log_tvl, shipped.value.value_prior,
-    shipped.value.growth, shipped.value.chain, shipped.value.missing_age,
   ];
   const inResid = live.map((p) => {
     const pred = valueFeatures(p, snapshot.as_of, cal, model).reduce((s, v, j) => s + v * shippedValueBeta[j]!, 0);
@@ -1084,7 +1082,7 @@ export function validateModel(snapshot: Snapshot, cal: Calibration, model: Model
   // The bootstrap: B resamples of the regression rows, priors held fixed, both halves refit at the
   // shipped ridge strengths.
   const b = 200;
-  const valueNames = ['intercept', 'log_tvl', 'value_prior', 'growth', 'chain', 'missing_age'];
+  const valueNames = ['intercept', 'log_tvl', 'value_prior'];
   const launchNames = ['intercept', 'age', 'growth', 'chain', 'launch_prior', 'missing_age'];
   const valueBoots: number[][] = [];
   const launchBoots: number[][] = [];
@@ -1188,10 +1186,9 @@ export function scoreCore(
     ? Math.min(model.delay_cap, model.delay_scale * Math.log(age / model.delay_threshold_days))
     : 0;
   const prior = priorOf(cal, p.category);
-  const vFeatures = valueFeatures(p, asOf, cal, model, tvlMult, growthMult);
+  const vFeatures = valueFeatures(p, asOf, cal, model, tvlMult);
   const vBeta = [
     fitted.value.intercept, fitted.value.log_tvl, fitted.value.value_prior,
-    fitted.value.growth, fitted.value.chain, fitted.value.missing_age,
   ];
   const logV = vFeatures.reduce((s, v, j) => s + v * vBeta[j]!, 0) - (missingGrowth ? model.missing_growth_penalty : 0);
   const vConditional = Math.exp(Math.max(-30, Math.min(30, logV)));
